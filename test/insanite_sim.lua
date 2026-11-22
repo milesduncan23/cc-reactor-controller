@@ -7,7 +7,7 @@
 -- the plugin never feeds fuel), four reactors whose burn rate follows their control rods (R6
 -- and R8 both make cyanite ingots, R5 magentite ingots, R7 rossinite fluid), each with a
 -- stand-in core Reactor object whose updateRods the plugin replaces, and a fake AE2 that
--- crafts yellorium / liquid cyanite / liquid magentite over time and records ANY other craft
+-- crafts liquid cyanite / liquid magentite over time and records ANY other craft
 -- request as a violation. A simulated player crafts Insanite Blocks out of ME by hand.
 
 dofile("test/cc_stubs.lua")
@@ -65,14 +65,14 @@ do
         insanite = 8, inanite = 8, netherite_block = 1,
         benitoite = 128, rossinite = 24000, verderium = 24000, ridiculite = 16, ludicrite = 32,
         magentite_fluid = 16000, magentite = 16, cyanite_fluid = 32000, blutonium = 92, cyanite = 216,
-        water = 92000, yellorium = 24, uranium = 240,
+        water = 92000, uranium = 240, yellorium = 0,
     }
     for res, value in pairs(expected) do
         check(math.abs((need[res] or -1) - value) < 1e-9, string.format("need %-16s = %s", res, value))
     end
     local expectedOps = { blutonium = 92, ludicrite = 32, ridiculite = 16, inanite = 8, insanite = 8, verderium = 12,
         ["reactors cyanite"] = 216, ["reactors magentite"] = 16, ["reactors rossinite"] = 24,
-        ["craft cyanite_fluid"] = 32, ["craft magentite_fluid"] = 16, ["craft yellorium"] = 24 }
+        ["craft cyanite_fluid"] = 32, ["craft magentite_fluid"] = 16 }
     for pid, value in pairs(expectedOps) do
         check(math.abs((ops[pid] or -1) - value) < 1e-9, string.format("ops %-22s = %s", pid, value))
     end
@@ -83,8 +83,11 @@ do
         if p.machine == "ae2" then crafts[#crafts + 1] = p.output end
     end
     table.sort(crafts)
-    check(table.concat(crafts, ",") == "cyanite_fluid,magentite_fluid,yellorium",
-        "AE2 crafts are exactly yellorium, liquid cyanite, liquid magentite")
+    check(table.concat(crafts, ",") == "cyanite_fluid,magentite_fluid",
+        "AE2 crafts are exactly liquid cyanite and liquid magentite")
+    local verderium = model.byId.verderium
+    check(verderium.inputs[1].res == "uranium" and verderium.inputs[1].qty == 2 and verderium.inputs[2].res == "blutonium",
+        "fluidizer recipe is ATM10's: 2 uranium + 1 blutonium -> 2 B verderium")
 
     -- Even if a config tried, nothing else can become a craft.
     local sneaky = copy(D)
@@ -121,7 +124,7 @@ end
 
 --region fake world
 
-local ALLOWED = { [id("yellorium")] = "item", [id("cyanite_fluid")] = "fluid", [id("magentite_fluid")] = "fluid" }
+local ALLOWED = { [id("cyanite_fluid")] = "fluid", [id("magentite_fluid")] = "fluid" }
 
 local function newWorld(opts)
     opts = opts or {}
@@ -181,8 +184,8 @@ local function newWorld(opts)
     fluidPort(D.machines.reprocessor.ports.fluid, rf, "bigreactors:reprocessorfluidinjector")
     local reprocessorTimer, reprocessorIdle = 0, 0
 
-    -- Fluidizer (solid mixing): 2 yellorium + 1 blutonium -> 2000 mB verderium
-    local fuelOk = { [id("yellorium")] = true, [id("blutonium")] = true }
+    -- Fluidizer (solid mixing, ATM10 recipe): 2 uranium + 1 blutonium -> 2000 mB verderium
+    local fuelOk = { [id("uranium")] = true, [id("blutonium")] = true }
     local fa, fb = slot(64, fuelOk), slot(64, fuelOk)
     inventoryPort(D.machines.fluidizer.ports.a, fa, "bigreactors:fluidizersolidinjector")
     inventoryPort(D.machines.fluidizer.ports.b, fb, "bigreactors:fluidizersolidinjector")
@@ -230,10 +233,6 @@ local function newWorld(opts)
         end
         if (opts.noPatterns or {})[gid] then return nil, "NOT_CRAFTABLE" end
         if pending(gid) then W.stats.craftDuplicates = W.stats.craftDuplicates + 1 end
-        if gid == id("yellorium") then
-            if (me.item[id("uranium")] or 0) < amount then return nil, "MISSING_ITEMS" end
-            add("item", id("uranium"), -amount)
-        end
         if gid == id("cyanite_fluid") or gid == id("magentite_fluid") then
             local ingot = (gid == id("cyanite_fluid")) and id("cyanite") or id("magentite")
             local need = math.ceil(amount / 1000)
@@ -310,7 +309,7 @@ local function newWorld(opts)
             if reprocessorIdle > (D.stallSeconds + 2 * D.cycleSeconds + 5) then W.stats.stuck = W.stats.stuck + 1 end
         end
 
-        local y = (fa.id == id("yellorium") and fa) or (fb.id == id("yellorium") and fb)
+        local y = (fa.id == id("uranium") and fa) or (fb.id == id("uranium") and fb)
         local b = (fa.id == id("blutonium") and fa) or (fb.id == id("blutonium") and fb)
         if y and b and y.n >= 2 and b.n >= 1 then
             take(y, 2); take(b, 1)
@@ -360,7 +359,6 @@ end
 
 local function stockUp(W)
     W.me.item[id("uranium")] = 400000 -- above the 200k floor, so R6 + R8 may run
-    W.me.item[id("yellorium")] = 1000
     W.me.item[id("blutonium")] = 64
     W.me.fluid[id("verderium")] = 24000
     W.me.fluid[id("water")] = 1e12
@@ -454,7 +452,7 @@ do
     local full = InsanitePlanner.rateTargets(D_RATIO, model, need, ops, stock, maxPace, {})
     t, d = InsanitePlanner.rateTargets(D_RATIO, model, need, ops, stock, maxPace, { [R5] = full[R5] / 2 })
     check(math.abs(t[R5] - full[R5] / 2) < 1e-9 and math.abs(t[R6] - full[R6] / 2) < 1e-9 and math.abs(t[R7] - full[R7] / 2) < 1e-9,
-        "reactor 5 at half its share -> yellorium & verderium reactors halve too")
+        "reactor 5 at half its share -> cyanite & verderium reactors halve too")
     check(d.limit == "R5 max burn", "status names the limiting reactor (" .. d.limit .. ")")
 
     -- Inside the cyanite pool: a weak member is held at its max, the other takes the rest.
@@ -764,7 +762,7 @@ do
     for res, n in pairs(need) do
         local def = D.resources[res]
         if res ~= "water" and res ~= "benitoite" and res ~= "netherite_block" and res ~= "uranium" then
-            W.me[def.kind][def.id] = D.stockBlocks * n + ((res == "yellorium") and 1000 or 0)
+            W.me[def.kind][def.id] = D.stockBlocks * n
         end
     end
     runWorld(W, 120)
@@ -772,22 +770,23 @@ do
         "locked reactors R5 and R7 don't burn while the kit is at target")
     check(W.reactors[R6].burnedTotal > 0, "stock reactors R6 + R8 keep filling cyanite toward its cap")
     check(next(W.stats.craftRequests) == nil, "no AE2 craft requested while everything is at target")
-    check(InsaniteFactory.lastNotes()["craft yellorium"] == "at target", "status says why")
+    check(InsaniteFactory.lastNotes()["craft cyanite_fluid"] == "at target", "status says why")
 end
 
 --endregion
 
 --region 8. AE2 craft requests
 
-print("AE2 craft requests: only the three allowed, sized, not repeated, honest about missing patterns")
+print("AE2 craft requests: only the two allowed, sized, not repeated, honest about missing patterns")
 do
     _G.__simClock = 0
     local W = newWorld()
     stockUp(W)
-    W.me.item[id("yellorium")] = 0
+    W.me.item[id("cyanite")] = 200
     runWorld(W, 60)
-    local yell = W.stats.craftRequests[id("yellorium")] or 0
-    check(yell > 0 and yell <= D.maxCraftItems * 6, string.format("yellorium short -> requested %d via craftItem", yell))
+    local liquid = W.stats.craftRequests[id("cyanite_fluid")] or 0
+    check(liquid > 0 and liquid <= D.maxCraftFluid * 6,
+        string.format("liquid cyanite short -> requested %.0fB via craftFluid", liquid / 1000))
     check(W.stats.craftDuplicates == 0, "one request at a time per item")
 
     _G.__simClock = 0
@@ -800,9 +799,9 @@ do
     _G.__simClock = 0
     W = newWorld()
     stockUp(W)
-    W.me.item[id("yellorium")] = 0
-    runWorld(W, 60, nil, { plantText = PLANT_TEXT:gsub("yellorium = true,", "yellorium = false,", 1) })
-    check((W.stats.craftRequests[id("yellorium")] or 0) == 0, "autocraft.yellorium = false -> never requested")
+    W.me.item[id("cyanite")] = 200
+    runWorld(W, 60, nil, { plantText = PLANT_TEXT:gsub("cyanite_fluid = true,", "cyanite_fluid = false,", 1) })
+    check((W.stats.craftRequests[id("cyanite_fluid")] or 0) == 0, "autocraft.cyanite_fluid = false -> never requested")
     check(W.stats.badCrafts == 0 and W.stats.badFilters == 0, "no disallowed crafts, filters typed (item/fluid)")
 end
 
@@ -963,12 +962,16 @@ do
         "a leftover inlet line is only a warning: " .. show(w))
 
     e = check_(function(p) p.autocraft = nil end)
-    check(#e == 1 and has(e, "autocraft is missing", "yellorium = true,", "cyanite_fluid = true,", "magentite_fluid = true,"),
+    check(#e == 1 and has(e, "autocraft is missing", "cyanite_fluid = true,", "magentite_fluid = true,")
+        and not has(e, "yellorium"),
         "missing autocraft section -> ready-to-paste block: " .. show(e))
 
     e = check_(function(p) p.autocraft.insanite = true end)
-    check(has(e, "autocraft.insanite", "may only ask AE2 to craft cyanite_fluid, magentite_fluid, yellorium"),
+    check(has(e, "autocraft.insanite", "may only ask AE2 to craft cyanite_fluid, magentite_fluid."),
         "crafting anything else is refused: " .. show(e))
+    e = check_(function(p) p.autocraft.yellorium = true end)
+    check(has(e, "autocraft.yellorium", "may only ask AE2 to craft cyanite_fluid, magentite_fluid.", "Remove that line"),
+        "a leftover yellorium autocraft line is refused: " .. show(e))
 
     e = check_(function(p) p.autocraft.magentite_fluid = nil end)
     check(has(e, "autocraft.magentite_fluid is missing", "Liquid", "magentite_fluid = true,") or

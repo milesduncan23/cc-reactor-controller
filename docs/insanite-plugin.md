@@ -14,8 +14,8 @@ controlling three things:
      until ME holds a configured amount of cyanite (`stockCaps.cyanite`, default 4096), giving you
      energy and spare cyanite, and stop while ME holds fewer than `stockFuelFloor.cyanite`
      (200,000) uranium ingots. The rest of the plant draws on that cyanite as it needs.
-3. **Three AE2 craft requests, and nothing else:** yellorium, liquid cyanite (from cyanite
-   ingots) and liquid magentite (from magentite ingots). Each is requested only while ME holds
+3. **Two AE2 craft requests, and nothing else:** liquid cyanite (from cyanite ingots) and liquid
+   magentite (from magentite ingots). Each is requested only while ME holds
    less than its target, and only if `autocraft` in `/insanite.conf` allows it. Crafting the
    blocks out of the kit is up to you.
 
@@ -36,17 +36,20 @@ All numbers are derived at boot from the recipe table in `config.lua`, starting 
 | 2 ludicrite + 1 B magentite → ridiculite | Reprocessor | 16 ops |
 | 2 blutonium + 1 B cyanite fluid → ludicrite | Reprocessor | 32 ops |
 | 2 cyanite + 1 B water → blutonium | Reprocessor | 92 ops |
-| 2 yellorium + 1 blutonium → 2 B verderium | Fluidizer (mixing) | 12 ops |
+| 2 uranium + 1 blutonium → 2 B verderium (ATM10's recipe) | Fluidizer (mixing) | 12 ops |
 | 1 cyanite ingot → 1 B liquid cyanite | AE2 craft | 32 crafts |
 | 1 magentite ingot → 1 B liquid magentite | AE2 craft | 16 crafts |
 | verderium → rossinite (fluid) | Reactor 7 | 24 B burned |
 | blutonium → magentite (ingots) | Reactor 5 | 16 ingots burned |
 | uranium → cyanite (ingots) | Reactors 6 + 8 (stock pool) | 216 ingots' worth; they burn more to fill the cyanite cap |
 
-Extreme Reactors burns uranium ingots exactly like yellorium.
+Extreme Reactors burns uranium ingots exactly like yellorium. ATM10 replaces the fluidizer's
+verderium recipe (2 yellorium ingots + 1 blutonium in the base mod) with 2 uranium ingots +
+1 blutonium (`kubejs/server_scripts/mods/ExtremeReactors/Recipes.js`), so no yellorium is used
+anywhere.
 
-Raw inputs per block: **240 uranium ingots** (216 burned by reactors 6 + 8, 24 turned into
-yellorium by AE2 for the fluidizer's verderium), **128 benitoite, 92 B water, 1 netherite block**.
+Raw inputs per block: **240 uranium ingots** (216 burned by reactors 6 + 8, 24 into the fluidizer
+for verderium), **128 benitoite, 92 B water, 1 netherite block**.
 Reprocessor time per block: 156 ops × 2 s ≈ 5.2 min. The reprocessor sets the maximum pace,
 about 10.4 blocks/h at 90% utilization.
 
@@ -90,8 +93,8 @@ R7 (rossinite). Each reactor's `rodControl` decides how its pool runs:
   `stockTaperPct` (10%) below the cap, so they don't flicker on and off.
 - **Fuel floor:** your importer feeds them uranium straight from ME, so they stop whenever ME
   holds fewer than `stockFuelFloor.cyanite` uranium ingots (200,000 in `/insanite.conf`). They
-  resume `stockFuelResumePct` (5%) above it, at 210,000. Yellorium (for the fluidizer) is crafted
-  from that same uranium, so the floor also keeps it available. The status line then reads
+  resume `stockFuelResumePct` (5%) above it, at 210,000. The fluidizer uses that same uranium,
+  so the floor also keeps it supplied. The status line then reads
   `stopped: ME uranium … is under the 200000 floor (resumes at 210000)`.
 - **Outside the safeguards meant for the lock:** the overflow guard ignores cyanite (a full cap is
   the point, not a blockage), it isn't part of the slowest-reactor limit, and it has no `dev`
@@ -160,11 +163,10 @@ Safety and fallbacks:
 - **Stale targets:** if the factory stops sending targets for `rodStaleSeconds` (bridge missing,
   plugin crashed), every reactor reverts to the core energy law.
 
-## AE2 craft requests (three, and only three)
+## AE2 craft requests (two, and only two)
 
 | Craft | Used for | Per Insanite Block |
 | --- | --- | --- |
-| `yellorium` | The fluidizer (verderium); made by AE2 from uranium ingots, 1 : 1 | 24 ingots (24 uranium) |
 | `cyanite_fluid` | The ludicrite recipe; made by AE2 from cyanite ingots | 32 B (32 ingots) |
 | `magentite_fluid` | The ridiculite recipe; made by AE2 from magentite ingots | 16 B (16 ingots) |
 
@@ -220,8 +222,8 @@ trim explains. If R6 isn't burning, the first burning reactor becomes the refere
 3. **Outputs back to ME.** Reactor outlets, the Reprocessor Output Port and the Fluidizer Output
    Port must end up in ME. Either pipe or import-bus them, or put them on the wired network and set
    `outlet` / `machines.<name>.output` so the plugin empties them.
-4. **AE2 patterns** for the crafts you enable: cyanite ingot → liquid cyanite, magentite ingot →
-   liquid magentite, and uranium ingot → yellorium.
+4. **AE2 patterns** for the crafts you enable: cyanite ingot → liquid cyanite, and magentite
+   ingot → liquid magentite.
 5. **Nothing else may feed** the reprocessor or fluidizer injectors. The reprocessor's single
    fluid injector is shared by water, liquid cyanite, liquid magentite and rossinite, so water must
    come from ME too.
@@ -237,7 +239,7 @@ Configuration is split in two, and no peripheral name appears in any Lua file:
 
 | File | Holds |
 | --- | --- |
-| **`/insanite.conf`** (on the computer; template `insanite.conf` in the repo) | **Every device, explicitly**: ME Bridge, status monitor, each machine's ports and output, and each reactor with its fuel, waste, rod mode and outlet. Plus which of the three AE2 crafts are allowed. Optionally, any tuning override. |
+| **`/insanite.conf`** (on the computer; template `insanite.conf` in the repo) | **Every device, explicitly**: ME Bridge, status monitor, each machine's ports and output, and each reactor with its fuel, waste, rod mode and outlet. Plus which of the two AE2 crafts are allowed. Optionally, any tuning override. |
 | `src/plugins/insanite/config.lua` | Game data and tuning only: item/fluid ids, recipes, machine capacities, peripheral kinds, thresholds. |
 
 ### Device definitions (`/insanite.conf`)
@@ -250,13 +252,13 @@ The repo's `insanite.conf` is your current in-game setup:
 | `monitor` | `"monitor_3"` | Status monitor (`false` = none) |
 | `referenceReactor` | `"BigReactors-Reactor_5"` | A `ratio` reactor the `dev` column compares against (optional) |
 | `machines.reprocessor.ports` | `solid` = `…reprocessorwasteinjector_0`, `fluid` = `…reprocessorfluidinjector_0` | The two injectors |
-| `machines.fluidizer.ports` | `a` = `…fluidizersolidinjector_0`, `b` = `…_1` | `a` gets yellorium, `b` blutonium |
+| `machines.fluidizer.ports` | `a` = `…fluidizersolidinjector_0`, `b` = `…_1` | `a` gets uranium, `b` blutonium |
 | `machines.<name>.output` | `false` | Output port for the plugin to empty into ME (`false` = piped/bused) |
 | `reactors[id]` | 5 blutonium→magentite (`ratio`), 6 and 8 uranium→cyanite (`stock`), 7 verderium→rossinite (`ratio`, liquid in and out); all `outlet = false` | Every factory reactor (no `inlet`: your ME importer feeds them) |
 | `stockCaps` | `cyanite = 4096` | How much of each stock pool's waste to keep in ME (ingots, or mB for fluids) |
 | `stockFuelFloor` | `cyanite = 200000` | Each stock pool stops while ME holds less of its fuel than this (here uranium ingots) |
 | `stockMaxBurn` | not set | Optional burn ceiling per stock pool, mB/t for all its reactors |
-| `autocraft` | `yellorium`, `cyanite_fluid`, `magentite_fluid` all `true` | Which of the three AE2 crafts may be requested |
+| `autocraft` | `cyanite_fluid`, `magentite_fluid` both `true` | Which of the two AE2 crafts may be requested |
 
 **Nothing may be left out.** `false` means "none" and has to be written explicitly. At boot the
 plugin checks the file against the devices actually on the network. If anything is wrong, it does
@@ -279,7 +281,7 @@ It catches, among others:
 | Typo'd key | `reactors["BigReactors-Reactor_5"].outlett is not a reactor setting (expected: fuel, waste, rodControl, outlet). Did you mean outlet?` |
 | Fuel/waste mismatch | `….waste = "cyanite" doesn't match fuel = "blutonium". blutonium burns into "magentite" (ingots, from a Solid Access Port in outlet mode) or "magentite_fluid" (fluid, …).` |
 | Same peripheral twice | `"…fluidizersolidinjector_0" is used for both machines.fluidizer.ports.a and reactors["…_6"].outlet.` |
-| A craft that isn't allowed | `autocraft.insanite: the plugin may only ask AE2 to craft cyanite_fluid, magentite_fluid, yellorium.` |
+| A craft that isn't allowed (including a leftover `yellorium = …` line) | `autocraft.yellorium: the plugin may only ask AE2 to craft cyanite_fluid, magentite_fluid. Remove that line; …` |
 | A liquid from two sources | `"cyanite_fluid" would come from both reactors["…_8"] (waste = "cyanite_fluid") and autocraft.cyanite_fluid. Pick one: …` |
 | Leftover `inlet` line | Warning only: `….inlet is no longer used (fuel is fed by your own ME importer, not the plugin). You can delete that line.` |
 | Stock pool without a cap | `stockCaps is missing: … stockCaps = { cyanite = 4096,   -- R6+R8 burn until ME holds this },` |
@@ -404,7 +406,7 @@ The test checks:
   lock would allow, filling regardless of a weak R5, and R5:R7 staying at 16:24
 - ratio mode for R6 + R8 (still supported): the 216:16:24 lock end to end, an even split, and a
   weak R8 covered by R6 without slowing anything
-- AE2 crafts: only the three allowed are ever requested, with typed item/fluid filters, sized to
+- AE2 crafts: only the two allowed are ever requested, with typed item/fluid filters, sized to
   the shortfall, never repeated while running, never when `autocraft` is false, and a missing
   pattern is shown and named as the blocker
 - the config checker against the in-game peripheral list: the repo `insanite.conf` passes clean,

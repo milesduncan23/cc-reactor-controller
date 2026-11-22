@@ -429,7 +429,7 @@ end
 
 --endregion
 
---region AE2 crafts (yellorium, liquid cyanite, liquid magentite only)
+--region AE2 crafts (liquid cyanite and liquid magentite only)
 
 local craftableCache = {}   -- res -> { value, at }
 
@@ -903,7 +903,7 @@ function Factory.init(extraOverrides)
     local rodsOn = _G.InsaniteRods and InsaniteRods.configure(cfg)
 
     local parts = {}
-    for _, res in ipairs({ "yellorium", "blutonium", "cyanite", "rossinite", "benitoite" }) do
+    for _, res in ipairs({ "uranium", "blutonium", "cyanite", "rossinite", "benitoite" }) do
         if need[res] and need[res] > 0 then
             parts[#parts + 1] = res .. " " .. fmtAmount(cfg.resources[res], need[res])
         end

@@ -2,7 +2,7 @@
 --
 -- Model: every machine runs "processes" (recipes) that turn input resources into one output.
 --   * batch machines (reprocessor, fluidizer) are loaded by the plugin
---   * AE2 crafts: only yellorium, liquid cyanite and liquid magentite, and only when enabled
+--   * AE2 crafts: only liquid cyanite and liquid magentite, and only when enabled
 --   * reactors: fuel -> waste, per 1000 mB of reactant. Reactors with the same waste form one
 --     pool (e.g. R6 + R8 -> cyanite) that shares that waste's production.
 -- Fuel is NOT planned: the player's own ME importer refuels the reactors.
@@ -20,10 +20,10 @@
 --
 -- Reactors (locked rate): rateTargets() picks ONE plant rate (Insanite Blocks per tick) and
 -- gives every "ratio" reactor pool rate x its fuel per block, so those pools burn in exact recipe
--- ratio. "stock" pools (e.g. the yellorium reactors -> cyanite) are decoupled: they fill ME with
+-- ratio. "stock" pools (e.g. the uranium reactors -> cyanite) are decoupled: they fill ME with
 -- their waste up to a cap from the config and are not part of the lock.
 -- The rate follows how far the finished kit in ME is below target, and is capped so no pool is
--- asked for more than it can burn: the yellorium reactors burn exactly as much as the blutonium
+-- asked for more than it can burn: the cyanite reactors burn exactly as much as the blutonium
 -- and verderium reactors can, and vice versa. Inside a pool, the target is split evenly, except
 -- that a member at its max burn is held there and the others take the rest.
 
@@ -33,7 +33,7 @@ local HUGE = math.huge
 
 -- The only things the plugin may ever ask AE2 to craft. Anything else is refused here and in
 -- the factory, whatever the config says.
-Planner.ALLOWED_CRAFTS = { yellorium = true, cyanite_fluid = true, magentite_fluid = true }
+Planner.ALLOWED_CRAFTS = { cyanite_fluid = true, magentite_fluid = true }
 
 local function clamp(value, lo, hi)
     if value < lo then return lo end
@@ -976,7 +976,7 @@ function Planner.validatePlant(plant, defaults, network)
                 if r.waste == nil then
                     err(path .. ".waste is missing: what its outlet gives.",
                         fuelOk and ("For fuel = " .. q(r.fuel) .. " that is " .. wasteForms(r.fuel) .. ".")
-                            or "It depends on the fuel: yellorium -> cyanite, blutonium -> magentite, verderium -> rossinite.")
+                            or "It depends on the fuel: uranium or yellorium -> cyanite, blutonium -> magentite, verderium -> rossinite.")
                 elseif fuelOk then
                     local okWaste = false
                     for _, w in ipairs(defaults.reactions[r.fuel]) do if w == r.waste then okWaste = true end end
@@ -1164,7 +1164,7 @@ function Planner.validatePlant(plant, defaults, network)
         lines[#lines + 1] = "},"
         err(table.unpack(lines))
     elseif type(plant.autocraft) ~= "table" then
-        err("autocraft must be a table like { yellorium = true, ... }, but it is " .. describe(plant.autocraft) .. ".")
+        err("autocraft must be a table like { cyanite_fluid = true, ... }, but it is " .. describe(plant.autocraft) .. ".")
     else
         for _, k in ipairs(keysOf(plant.autocraft)) do
             if not Planner.ALLOWED_CRAFTS[k] then

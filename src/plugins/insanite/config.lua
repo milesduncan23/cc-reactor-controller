@@ -5,7 +5,7 @@
 --   * dosing the reprocessor and fluidizer, and
 --   * setting one common reaction rate for the four reactors, so each burns exactly its share
 --     of the fuel per block and none outruns the others.
--- It never asks AE2 to craft anything except yellorium, liquid cyanite and liquid magentite
+-- It never asks AE2 to craft anything except liquid cyanite and liquid magentite
 -- (see `crafts`), and only those enabled in /insanite.conf. Reactor fuel is NOT handled here:
 -- your own ME importer refuels the reactors; the plugin only sets their burn rates.
 --
@@ -62,13 +62,12 @@ _G.INSANITE_DEFAULTS = {
 
     ejectWasteAbovePct = 0,   -- >0: call doEjectWaste() when a reactor's waste exceeds this % (0 = off)
 
-    -- AE2 autocraft requests: the ONLY three things the plugin may ever ask AE2 to craft (also
+    -- AE2 autocraft requests: the ONLY two things the plugin may ever ask AE2 to craft (also
     -- enforced in code). Each must be switched on in /insanite.conf (autocraft = { ... }) and
     -- needs a matching pattern in AE2. A request is made when ME holds less than stockBlocks'
     -- worth and AE2 isn't already crafting it. `inputs`/`outQty` describe one craft so the
     -- ratios include what it consumes; match them to your AE2 pattern.
     crafts = {
-        yellorium       = { outQty = 1,    inputs = { { res = "uranium", qty = 1 } } },    -- made from uranium ingots
         cyanite_fluid   = { outQty = 1000, inputs = { { res = "cyanite", qty = 1 } } },    -- 1 cyanite ingot -> 1000 mB
         magentite_fluid = { outQty = 1000, inputs = { { res = "magentite", qty = 1 } } },  -- 1 magentite ingot -> 1000 mB
     },
@@ -174,11 +173,11 @@ _G.INSANITE_DEFAULTS = {
         { id = "blutonium", machine = "reprocessor", output = "blutonium", outQty = 1,
           inputs = { { res = "cyanite", qty = 2, port = "solid" }, { res = "water", qty = 1000, port = "fluid" } } },
         { id = "verderium", machine = "fluidizer", output = "verderium", outQty = 2000,
-          inputs = { { res = "yellorium", qty = 2, port = "a" }, { res = "blutonium", qty = 1, port = "b" } } },
+          inputs = { { res = "uranium", qty = 2, port = "a" }, { res = "blutonium", qty = 1, port = "b" } } },
     },
 
     -- Reactors are defined only in /insanite.conf. For reference, reactors burn fuel into waste
     -- 1:1 (per 1000 mB): yellorium -> cyanite, blutonium -> magentite, verderium -> rossinite.
-    -- Several reactors may produce the same waste (e.g. two yellorium reactors -> cyanite):
+    -- Several reactors may produce the same waste (e.g. two uranium reactors -> cyanite):
     -- they share that waste's target, and the plant only slows when all of them are maxed.
 }
