@@ -49,7 +49,19 @@ verderium recipe (2 yellorium ingots + 1 blutonium in the base mod) with 2 urani
 anywhere.
 
 Raw inputs per block: **240 uranium ingots** (216 burned by reactors 6 + 8, 24 into the fluidizer
-for verderium), **128 benitoite, 92 B water, 1 netherite block**.
+for verderium), **128 benitoite, 92 B water**, and 1 netherite block, which AE2 crafts itself.
+
+**Inputs, by how they reach ME** (`config.lua`, overridable in `/insanite.conf`):
+
+- **Raw stock, not craftable:** benitoite, uranium and water (nothing here makes them), plus
+  **cyanite** (`rawResources`: R6 + R8 still make some, but your MA crops supply it). Recipes and
+  AE2 crafts wait until ME holds them. The status screen lists them as `raw`, red under one
+  block's worth, and a slowdown names them as the cause when they run out
+  (`Blocked: blutonium needs cyanite`).
+- **Autocrafted prerequisites** (`autocraftedInputs`): **netherite blocks.** AE2 crafts them itself
+  inside the Insanite Block job, so the plugin never waits on them and doesn't show them. If AE2
+  can't make them (out of netherite ingots, missing pattern), it refuses the craft and you get the
+  `AE2 REFUSED …` alert.
 Reprocessor time per block: 156 ops × 2 s ≈ 5.2 min. The reprocessor sets the maximum pace,
 about 10.4 blocks/h at 90% utilization.
 
@@ -238,9 +250,10 @@ The first three keep ME stocked and follow the rules below.
 
 Once ME holds the **full kit target** (`stockBlocks` = 2 blocks' worth: 16 insanite and 16
 inanite), the plugin asks AE2 for as many **Insanite Blocks** (`bigreactors:insanite_block`) as
-ME has every kit item for, netherite blocks included. That's normally 2. AE2 does the two crafts
-from its patterns:
+the insanite and inanite cover, normally 2. It never waits on netherite blocks. AE2 does the
+crafts from its patterns, making whatever ME lacks along the way:
 
+- Netherite Block, from your pattern, when ME is short of them
 - Inanite Block = 8 inanite ingots around 1 netherite block
 - Insanite Block = 8 insanite ingots around 1 Inanite Block
 
@@ -250,12 +263,15 @@ this, a full kit simply held the plant at `kit full`.
 - **Only on the full target,** not on intermediates: the kit is what the block is made of, and the
   plant always finishes it from its stocked intermediates.
 - **Never twice:** no request while AE2 is still crafting it.
-- **Needs both AE2 patterns.** If either is missing, or ME has no netherite block, nothing is
-  requested. The alert `KIT FULL, but AE2 can't craft Insanite Blks: …` names which, since the plant
-  would otherwise sit at `kit full`. With one netherite block, one Insanite Block is crafted.
+- **Needs the AE2 patterns.** Without an Insanite Block pattern nothing is requested, and the
+  alert `KIT FULL, but AE2 can't craft Insanite Blks: no AE2 pattern …` says so, since the plant
+  would otherwise sit at `kit full`. If AE2 refuses the request (an Inanite Block or Netherite
+  Block pattern missing, or no netherite ingots to make the blocks from), the refusal is logged once
+  and, after `craftFailAlertCount` (3) refusals in a row, raises `AE2 REFUSED the Insanite Blk craft
+  N times in a row: <AE2's reason>`. The alert clears once AE2 accepts again.
 - **The machines stop button stops it** (`crafts stopped`), like the other crafts.
 - **Status:** the `craft block` line shows `waiting: kit 1.4/2 blk`, `request 2`, `AE2 crafting`,
-  `needs netherite_block`, `no AE2 pattern` or `crafts stopped`, plus how many blocks are in ME.
+  `no AE2 pattern` or `crafts stopped`, plus how many blocks are in ME.
 - **Off:** `autocraft.insanite_block = false`. The kit then just sits full, as before.
 
 ## Stop buttons
@@ -305,7 +321,8 @@ SCRAM or stop anything.
 | `REPROCESSOR stalled on …` / `port missing` / `unknown contents` | A batch machine can't run. |
 | `ME BRIDGE … NOT FOUND` | The factory is paused. |
 | `REPROCESSOR AT CAPACITY: busy 92% of the last 5 min with work waiting (ludicrite, inanite). It's limiting throughput; another reprocessor would raise it.` (same for the fluidizer) | Over the last `machineAlertSeconds` (5 min) the machine was **actually working** at least `machineAlertPct` (75%) of the time, and ready work (a product below target with every ingredient in ME) waited for it in at least `machineBacklogPct` (50%) of the cycles. Working time is real work: each batch counts its operations × the time per operation (2 s for the reprocessor, from the mod; for the fluidizer, learned from how long its batches take), never past the moment it was seen finished. So a reprocessor doing one 2-second blutonium job per 5-second cycle reads about 40% and doesn't alert: it's starved, not saturated. Raised as **advisory** in SCADA, since it's a limit, not a fault. The machine's row on the status screen shows `busy N%` (with `(warming up)` until 5 min of history exist). It can show right after a start or a shortage, while the plant catches up at full pace. The machines stop button resets the measurement. |
-| `KIT FULL, but AE2 can't craft Insanite Blks: no AE2 pattern …` / `ME has no Netherite Blk` | The kit is at target, the Insanite Block autocraft is on, but AE2 can't make the block. The plant holds at `kit full` until it can. |
+| `KIT FULL, but AE2 can't craft Insanite Blks: no AE2 pattern …` | The kit is at target and the Insanite Block autocraft is on, but AE2 has no Insanite Block pattern. The plant holds at `kit full` until it has one. |
+| `AE2 REFUSED the Insanite Blk craft 3 times in a row: MISSING_ITEMS. Check its patterns (Insanite Block, Inanite Block, Netherite Block) and that AE2 can make every ingredient.` (same for any other craft) | AE2 rejected the same request `craftFailAlertCount` (3) times in a row: a pattern somewhere in the tree is missing, or AE2 can't make an ingredient (e.g. it's out of netherite ingots). The first refusal is logged in the events; the alert clears once AE2 accepts again. |
 
 An alert clears once its cause has been gone for `alertClearSeconds` (30 s). A slowdown alert stays
 up until the plant is back within 15% of the asked pace, so it doesn't flicker around the threshold.
@@ -332,8 +349,9 @@ trim explains. If R6 isn't burning, the first burning reactor becomes the refere
    Port must end up in ME. Either pipe or import-bus them, or put them on the wired network and set
    `outlet` / `machines.<name>.output` so the plugin empties them.
 4. **AE2 patterns** for the crafts you enable: cyanite ingot → liquid cyanite, magentite
-   ingot → liquid magentite, and for the block: Inanite Block (8 inanite + 1 netherite block) and
-   Insanite Block (8 insanite + 1 Inanite Block), with molecular assemblers for the two.
+   ingot → liquid magentite, and for the block: Netherite Block (from netherite ingots), Inanite
+   Block (8 inanite + 1 netherite block) and Insanite Block (8 insanite + 1 Inanite Block), with
+   molecular assemblers for them.
 5. **The blutonium reprocessor** (`autocraft.blutonium = true`): a second Reprocessor that only
    ever makes blutonium, kept off the plugin's wired network (the plugin never loads it):
    - **Water on its own, always on:** pipe water into its Fluid Injector permanently (an infinite
@@ -350,7 +368,8 @@ trim explains. If R6 isn't burning, the first burning reactor becomes the refere
    fluid injector is shared by water, liquid cyanite, liquid magentite and rossinite, so water must
    come from ME too.
 7. **ME stock**: uranium ingots (over the 200,000 floor for R6 + R8 to run), water, benitoite
-   crystals (mined), netherite blocks.
+   crystals (mined) and cyanite (MA crops); for the netherite blocks, a pattern AE2 can use plus
+   what it needs (netherite ingots).
 8. **Power.** The four reactors no longer follow energy demand. They stop when the kit is full.
    If your base depends on one of them for power, set that reactor's `rodControl = "power"` (it
    then leaves the locked ratio).
@@ -439,6 +458,9 @@ tuning key that isn't a setting (`Did you mean stockBlocks?`).
 | `slowAlertSeconds` | 600 | …but only after this long when no cause is found |
 | `alertClearSeconds` | 30 | Alert clears once its cause has been gone this long |
 | `scadaAlarms` | true | Also raise alerts in the core's alarm list (SCADA screen) |
+| `autocraftedInputs` | `netherite_block` | Prerequisites AE2 crafts inside the craft that needs them: never waited on, not shown |
+| `rawResources` | `cyanite` | Made here too but supplied as stock: treated as raw (waited on, shown as `raw`, named in slowdowns) |
+| `craftFailAlertCount` | 3 | Alert after AE2 refuses the same craft this many times in a row |
 | `machineAlertPct` / `machineBacklogPct` / `machineAlertSeconds` | 75 / 50 / 300 | A machine is "at capacity" when it's actually working this % of the window and ready work waited for it in this % of the cycles |
 | `capacitySeconds` | 30 | Rods fully out this long and still short → reactor at its max |
 | `rodStaleSeconds` | 60 | Revert to the core energy law if targets stop arriving |
@@ -459,7 +481,8 @@ A 4×4 Advanced Monitor fits it (about 45 lines, 79 characters wide). It shows:
 - **Header:** kit coverage, how many blocks you could craft right now, and the plant rate vs max
   pace with what's limiting it (`kit reserve`, `kit full`, `R5 max burn`, `overflow rossinite`…).
 - **Resources:** ME stock, per-block need and coverage. Green = at target, orange = short, red =
-  a raw input under one block's worth.
+  a raw input (benitoite, cyanite, uranium, water) under one block's worth. Netherite blocks
+  aren't listed: AE2 crafts them.
 - **Machines:** batch machine state with its `busy N%` (real work over the last 5 min; orange
   when it's at capacity), what each recipe is doing (`start x5`,
   `needs water`, `waiting`, `at target`), and the `craft block` line (Insanite Block autocraft,
@@ -549,9 +572,15 @@ The test checks:
   own; the real wait loop reacts to a tap at once; a reconnected reactor gets the hold on the
   same event
 - Insanite Block autocraft: nothing while the kit is short; at target both blocks are requested
-  at once (one with one netherite block, none without and an alert, none and an alert without the
-  AE2 pattern, none while AE2 is crafting it or the machines button is on, never when off); from a
-  full kit the plant refills and AE2 crafts again repeatedly, each time with the full kit
+  at once, whatever netherite ME holds (AE2 crafts the missing netherite blocks); none and an alert
+  without the Insanite Block pattern; none while AE2 is crafting it or the machines button is on,
+  never when off; when AE2 refuses (no netherite to be had), the refusal is logged once, alerted
+  after 3 in a row, and cleared once AE2 accepts; from a full kit the plant refills and AE2 crafts
+  again repeatedly, each time with the full kit
+- inputs: cyanite, benitoite, uranium and water are raw stock that AE2 crafts wait for (no
+  cyanite: no blutonium or liquid-cyanite request; no water: no blutonium request); netherite blocks
+  never hold back the block craft; the status screen lists the four as raw (cyanite red when short)
+  and doesn't list netherite blocks
 - full batches first: a recipe with only part of a batch waits while a full batch runs, keeps
   holding its cyanite, and loads what it has when nothing else is ready
 - in-game situation (cyanite trickling in, R7's tank soaking up verderium, your reactor speeds):

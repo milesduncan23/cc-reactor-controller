@@ -28,9 +28,20 @@ _G.INSANITE_DEFAULTS = {
     -- whether you have enough of it.
     kit = { insanite = 8, inanite = 8, netherite_block = 1 },
 
+    -- Inputs, by how they reach ME:
+    --   * autocraftedInputs: prerequisites AE2 crafts itself inside the craft that needs them
+    --     (netherite blocks, inside the Insanite Block job). Never waited on and not shown on the
+    --     status screen; if AE2 can't make them, the refused craft raises an alert.
+    --   * raw: everything nothing here makes (benitoite, uranium, water), plus rawResources (what
+    --     the plant also makes but you supply: cyanite from MA crops). Not craftable: recipes and
+    --     AE2 crafts wait until ME holds them, the status screen shows them as raw (red under one
+    --     block's worth), and a slowdown names them as the cause when they run out.
+    autocraftedInputs = { netherite_block = true },
+    rawResources = { cyanite = true },
+
     -- The finished block. Once ME holds the full kit target (stockBlocks' worth of insanite and
     -- inanite) and autocraft.insanite_block is on, the plugin asks AE2 for as many Insanite Blocks
-    -- as ME has every kit item for (netherite included). AE2 needs patterns for the Insanite Block
+    -- as the insanite and inanite cover (netherite blocks are autocrafted, see above). AE2 needs patterns for the Insanite Block
     -- and the Inanite Block. The kit then empties and the plant refills it.
     blockCraft = "insanite_block",
 
@@ -105,6 +116,7 @@ _G.INSANITE_DEFAULTS = {
     machineAlertPct = 75,     -- a machine is "at capacity" when it's working this % of the time
     machineBacklogPct = 50,   -- ... and ready work waited for it in this % of the cycles
     machineAlertSeconds = 300,-- ... over this window
+    craftFailAlertCount = 3,  -- alert when AE2 refuses the same craft this many times in a row
     alertClearSeconds = 30,   -- an alert clears once its cause has been gone this long
     scadaAlarms = true,
 

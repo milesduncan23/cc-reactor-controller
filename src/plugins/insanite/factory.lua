@@ -34,6 +34,7 @@ local lastStock, lastProjected = {}, {}
 local blocksInMe = nil       -- finished blocks (cfg.blockCraft) in ME, for the status screen
 local machineLoad = {}       -- machineName -> recent samples { t, limited, waiting = { processId... } }
 local machineRuns = {}       -- machineName -> recent batches { t0, ops, tEnd }
+local craftFailures = {}     -- craft output -> { count, err }: AE2 refusals in a row
 local opSecondsLearned = {}  -- machineName -> seconds per operation, measured (when the mod's isn't known)
 local events = {}
 local cycleCount = 0
@@ -533,9 +534,17 @@ local function requestCraft(p, ops)
     end
     if ok then
         event("AE2 craft %s %s", def.kind == "fluid" and string.format("%.1fB", amount / 1000) or tostring(amount), p.output)
+        craftFailures[p.output] = nil
+        return true
     else
-        event("AE2 craft %s failed: %s", p.output, tostring(err))
+        -- AE2 said no (a missing pattern somewhere in the tree, or ingredients it can't make).
+        -- Logged once; repeated refusals raise an alert (see buildAlerts).
+        local f = craftFailures[p.output] or { count = 0 }
+        craftFailures[p.output] = f
+        f.count, f.err = f.count + 1, tostring(err)
+        if f.count == 1 then event("AE2 craft %s refused: %s", p.output, f.err) end
         craftableCache[p.output] = nil
+        return false
     end
 end
 
@@ -692,8 +701,8 @@ local deviation = { reactors = {} } -- last InsanitePlanner.deviations result
 local function blockers(notes)
     local out = {}
     for _, p in ipairs(model.processes) do
-        local res = (notes[p.id] or ""):match("^needs (.+)$")
-        if res and not model.producerOf[res] then out[#out + 1] = p.id .. " needs " .. res end
+        local res = (notes[p.id] or ""):match("^needs (%S+)")
+        if res and InsanitePlanner.isRaw(model, res) then out[#out + 1] = p.id .. " needs " .. res end
         if notes[p.id] == "no AE2 pattern" then out[#out + 1] = p.id .. ": no AE2 pattern" end
     end
     for name, st in pairs(machineState) do
@@ -793,6 +802,22 @@ local function buildAlerts(notes)
             end
         else
             trackSince[id] = nil
+        end
+    end
+
+    -- AE2 keeps refusing a craft the plugin asks for.
+    local refused = {}
+    for res in pairs(craftFailures) do refused[#refused + 1] = res end
+    table.sort(refused)
+    for _, res in ipairs(refused) do
+        local f = craftFailures[res]
+        if f.count >= (cfg.craftFailAlertCount or 3) then
+            local def = cfg.resources[res] or {}
+            local what = (res == cfg.blockCraft) and "its patterns (Insanite Block, Inanite Block, Netherite Block)"
+                or "its pattern"
+            add("craftfail:" .. res, string.format(
+                "AE2 REFUSED the %s craft %d times in a row: %s. Check %s and that AE2 can make every ingredient.",
+                def.label or res, f.count, f.err, what))
         end
     end
 
@@ -951,13 +976,18 @@ local function buildStatus()
     end
 
     add("Resource        ME      per-blk  have/target", colors.lightGray)
+    -- Products first (in recipe order), then raw stock; autocrafted prerequisites (netherite
+    -- blocks) aren't monitored at all.
     local order, seen = {}, {}
     for _, p in ipairs(model.processes) do
-        if not seen[p.output] then order[#order + 1] = p.output; seen[p.output] = true end
+        if not seen[p.output] and not InsanitePlanner.isRaw(model, p.output) then
+            order[#order + 1] = p.output
+            seen[p.output] = true
+        end
     end
     local raws = {}
     for res, n in pairs(need) do
-        if n > 0 and not seen[res] then raws[#raws + 1] = res end
+        if n > 0 and not seen[res] and not (model.autocrafted or {})[res] then raws[#raws + 1] = res end
     end
     table.sort(raws)
     for _, res in ipairs(raws) do order[#order + 1] = res end
@@ -965,9 +995,9 @@ local function buildStatus()
         local def = cfg.resources[res]
         local n = need[res] or 0
         if n > 0 then
-            local produced = model.producerOf[res] ~= nil
+            local produced = not InsanitePlanner.isRaw(model, res)
             local cov = (lastProjected[res] or 0) / n
-            local sp = rateDetail and rateDetail.stockPools[res]
+            local sp = produced and rateDetail and rateDetail.stockPools[res]
             local target = produced and string.format("%.1f/%g", cov, K) or "raw"
             if sp then target = "cap " .. fmtAmount(def, sp.cap) end
             local text = string.format("%-14s %8s %8s  %s", def.label or res,
@@ -1222,7 +1252,7 @@ function Factory.init(extraOverrides)
     lastNotes, lastActions, lastStock, lastProjected = {}, {}, {}, {}
     blocksInMe = nil
     alerts, alertOrder, trackSince, deviation, slowSince = {}, {}, {}, { reactors = {} }, nil
-    machineLoad, machineRuns, opSecondsLearned = {}, {}, {}
+    machineLoad, machineRuns, opSecondsLearned, craftFailures = {}, {}, {}, {}
     local saved = readTableFile(cfg.stateFile)
     for name, process in pairs(saved or {}) do
         machineState[name] = { process = process }
@@ -1369,8 +1399,7 @@ function Factory.cycle()
         end
         local n, note = InsanitePlanner.blockCraft(cfg, model, stock,
             { stopped = stopped.machines, crafting = crafting, craftable = craftable })
-        if n > 0 then
-            requestCraft({ output = blockRes, outQty = 1 }, n)
+        if n > 0 and requestCraft({ output = blockRes, outQty = 1 }, n) then
             event("kit full: %d %s requested from AE2", n, cfg.resources[blockRes].label or blockRes)
         end
         notes["craft " .. blockRes] = note

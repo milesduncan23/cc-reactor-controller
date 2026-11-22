@@ -75,6 +75,8 @@ end
 -- Build the process graph from config. Returns model, errors (list of strings).
 function Planner.buildModel(cfg)
     local model = {
+        autocrafted = cfg.autocraftedInputs or {}, -- res -> true: AE2 makes it inside the craft needing it
+        rawResources = cfg.rawResources or {},     -- res -> true: made here too, but treated as raw stock
         resources = cfg.resources or {},
         processes = {},
         byId = {},
@@ -246,15 +248,23 @@ function Planner.kitCoverage(model, stock)
     return cov == HUGE and 0 or cov
 end
 
--- Whole Insanite Blocks you could craft right now from ME (all kit items, incl. netherite).
+-- Whole Insanite Blocks the kit in ME covers (autocrafted prerequisites, netherite blocks, aside).
 function Planner.craftableBlocks(model, stock)
     local n = HUGE
-    for res, qty in pairs(model.kit) do n = math.min(n, (stock[res] or 0) / qty) end
+    for res, qty in pairs(model.kit) do
+        if not (model.autocrafted or {})[res] then n = math.min(n, (stock[res] or 0) / qty) end
+    end
     return n == HUGE and 0 or math.floor(n)
 end
 
+-- Raw stock: nothing here makes it, or it's listed in rawResources (made here, but supplied too).
+function Planner.isRaw(model, res)
+    return model.producerOf[res] == nil or (model.rawResources or {})[res] == true
+end
+
 -- The finished-block craft (cfg.blockCraft): once ME holds the full kit target, ask AE2 for as
--- many blocks as ME has every kit item for. Returns the count to request (0 = none) and a note.
+-- many blocks as the kit covers; autocrafted prerequisites (netherite blocks) are AE2's to craft.
+-- Returns the count to request (0 = none) and a note.
 -- snap = { stopped = machines stop button on, crafting = AE2 job running, craftable = false when
 -- AE2 has no pattern }.
 function Planner.blockCraft(cfg, model, stock, snap)
@@ -267,14 +277,10 @@ function Planner.blockCraft(cfg, model, stock, snap)
     local kit = Planner.kitCoverage(model, stock)
     if kit < K then return 0, string.format("waiting: kit %.1f/%g blk", kit, K) end
     if snap.craftable == false then return 0, "no AE2 pattern" end
+    -- Whole blocks the kit covers. Autocrafted prerequisites (netherite blocks) never hold it back:
+    -- AE2 crafts them inside the same job when ME is short.
     local n = Planner.craftableBlocks(model, stock)
-    if n < 1 then
-        local short
-        for _, item in ipairs(sortedKeys(model.kit)) do
-            if (stock[item] or 0) < model.kit[item] then short = item end
-        end
-        return 0, "needs " .. tostring(short)
-    end
+    if n < 1 then return 0, string.format("waiting: kit %.1f/%g blk", kit, K) end
     n = math.min(n, cfg.maxCraftItems or 64)
     return n, "request " .. n
 end
@@ -325,6 +331,9 @@ function Planner.plan(cfg, model, need, snap)
         projected[res] = avail[res] + ((snap.pending or {})[res] or 0)
     end
 
+    -- Autocrafted prerequisites (netherite blocks) never hold back an AE2 craft: AE2 makes them
+    -- inside the same job. Every other input, raw or not, has to be in ME.
+    local function counts(p, res) return p.machine ~= "ae2" or not (model.autocrafted or {})[res] end
     local candidates, notes, holds = {}, {}, {}
     local waiting, waitingSeen = {}, {}
     local function addWaiting(machine, pid)
@@ -408,7 +417,7 @@ function Planner.plan(cfg, model, need, snap)
     local heldFor, heldBy = {}, {} -- res -> holding recipe; recipe -> { res = amount }
     local function hold(p, ops)
         for _, inp in ipairs(p.inputs) do
-            local k = math.min(avail[inp.res] or 0, ops * inp.qty)
+            local k = counts(p, inp.res) and math.min(avail[inp.res] or 0, ops * inp.qty) or 0
             if k > 0 then
                 avail[inp.res] = avail[inp.res] - k
                 heldFor[inp.res] = heldFor[inp.res] or p.id
@@ -449,8 +458,10 @@ function Planner.plan(cfg, model, need, snap)
         local full = math.min(c.wanted, c.cap)
         local short, shortOps = nil, HUGE
         for _, inp in ipairs(p.inputs) do
-            local canDo = math.floor((avail[inp.res] or 0) / inp.qty)
-            if canDo < shortOps then short, shortOps = inp.res, canDo end
+            if counts(p, inp.res) then
+                local canDo = math.floor((avail[inp.res] or 0) / inp.qty)
+                if canDo < shortOps then short, shortOps = inp.res, canDo end
+            end
         end
         if exclusive and not secondPass and shortOps >= 1 and shortOps < full then
             deferred[#deferred + 1] = c
@@ -460,7 +471,7 @@ function Planner.plan(cfg, model, need, snap)
         local ops = math.min(full, shortOps)
         if ops >= 1 then
             for _, inp in ipairs(p.inputs) do
-                avail[inp.res] = avail[inp.res] - ops * inp.qty
+                if counts(p, inp.res) then avail[inp.res] = avail[inp.res] - ops * inp.qty end
             end
             if exclusive then
                 taken[p.machine] = p.id

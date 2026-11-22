@@ -249,6 +249,12 @@ local function newWorld(opts)
             local i, a, n = id("insanite"), id("inanite"), id("netherite_block")
             table.insert(W.stats.blockRequests, { count = amount, insanite = me.item[i] or 0, inanite = me.item[a] or 0,
                 netherite = me.item[n] or 0 })
+            -- opts.craftsNetherite: AE2 has a netherite block pattern and makes what ME lacks
+            local missing = amount - (me.item[n] or 0)
+            if missing > 0 and opts.craftsNetherite then
+                add("item", n, missing)
+                W.stats.netheriteCrafted = (W.stats.netheriteCrafted or 0) + missing
+            end
             if (me.item[i] or 0) < 8 * amount or (me.item[a] or 0) < 8 * amount or (me.item[n] or 0) < amount then
                 return nil, "MISSING_ITEMS"
             end
@@ -829,9 +835,11 @@ do
     n, note = bc(full)
     check(n == 2 and note == "request 2", "kit at target -> both blocks requested (" .. note .. ")")
     n = bc({ insanite = 16, inanite = 16, netherite_block = 1 })
-    check(n == 1, "one netherite block -> only one block")
+    check(n == 2, "one netherite block in ME: still both requested (AE2 crafts the other)")
     n, note = bc({ insanite = 16, inanite = 16, netherite_block = 0 })
-    check(n == 0 and note == "needs netherite_block", "no netherite -> waits (" .. note .. ")")
+    check(n == 2 and note == "request 2", "no netherite in ME: doesn't wait on it (" .. note .. ")")
+    n = bc({ insanite = 24, inanite = 17, netherite_block = 0 })
+    check(n == 2, "sized by the plant's own kit items only (24 insanite, 17 inanite -> 2)")
     n, note = bc(full, { craftable = false })
     check(n == 0 and note == "no AE2 pattern", "no AE2 pattern -> nothing (" .. note .. ")")
     n, note = bc(full, { crafting = true })
@@ -879,19 +887,35 @@ do
     check(W.reactors[R5].burnedTotal > 0 and W.reactors[R7].burnedTotal > 0, "R5 + R7 run again to refill the kit")
     check(W.stats.craftDuplicates == 0 and W.stats.badCrafts == 0, "never re-requested while crafting, nothing disallowed")
 
-    W = fullKitWorld(1)
+    -- No netherite blocks in ME, but AE2 has a pattern for them: requested anyway, AE2 makes them.
+    W = fullKitWorld(0, { craftsNetherite = true })
     runWorld(W, 30)
-    check(W.stats.blockRequests[1] and W.stats.blockRequests[1].count == 1, "one netherite block in ME -> one block requested")
+    check(W.stats.blockRequests[1] and W.stats.blockRequests[1].count == 2 and amount(W, "insanite_block") == 2
+        and W.stats.netheriteCrafted == 2, "no netherite in ME: both blocks requested, AE2 crafted the 2 netherite blocks")
 
     local function alertText(key)
         for _, a in ipairs(InsaniteFactory.alerts()) do if a.key == key then return a.text end end
     end
+    -- AE2 can't make the netherite blocks (no pattern / no ingots): it refuses, the plugin says so.
     W = fullKitWorld(0)
     runWorld(W, 30)
-    check(#W.stats.blockRequests == 0 and InsaniteFactory.lastNotes()["craft insanite_block"] == "needs netherite_block",
-        "no netherite -> nothing requested, status says why")
-    check((alertText("blockcraft") or ""):find("ME has no Netherite Blk", 1, true),
-        "alert: " .. tostring(alertText("blockcraft")))
+    check(#W.stats.blockRequests >= D.craftFailAlertCount and amount(W, "insanite_block") == 0,
+        "AE2 refuses every request (" .. #W.stats.blockRequests .. " attempts)")
+    local refused = alertText("craftfail:insanite_block") or ""
+    check(refused:find("AE2 REFUSED the Insanite Blk craft", 1, true) and refused:find("MISSING_ITEMS", 1, true)
+        and refused:find("Netherite Block", 1, true), "alert: " .. refused)
+    -- Logged once (at the first refusal), not every cycle; no "requested" claim while refused.
+    local refusedEv, requestedEv = 0, 0
+    for _, e in ipairs(InsaniteFactory.events()) do
+        if e:find("insanite_block refused", 1, true) then refusedEv = refusedEv + 1 end
+        if e:find("requested from AE2", 1, true) then requestedEv = requestedEv + 1 end
+    end
+    check(refusedEv == 1 and requestedEv == 0, "refusal logged once, nothing claimed as requested ("
+        .. table.concat(InsaniteFactory.events(), " | ") .. ")")
+    W.me.item[id("netherite_block")] = 10
+    runWorld(W, D.alertClearSeconds + 2 * D.cycleSeconds, nil, { continue = true })
+    check(alertText("craftfail:insanite_block") == nil and amount(W, "insanite_block") >= 2,
+        "netherite arrives: AE2 accepts, blocks made, alert cleared")
 
     W = fullKitWorld(500, { noPatterns = { [id("insanite_block")] = true } })
     runWorld(W, 30)
@@ -907,6 +931,58 @@ do
     check(#W.stats.blockRequests == before and InsaniteFactory.lastNotes()["craft insanite_block"] == "crafts stopped",
         "machines button on -> no block craft even with the kit full")
     InsaniteFactory.setStopped("machines", false)
+end
+
+--endregion
+
+--region 7c. raw stock vs autocrafted prerequisites
+
+print("inputs: netherite blocks are AE2's to craft; cyanite, benitoite, uranium, water are raw stock")
+do
+    local DA = InsaniteFactory.deepMerge(InsaniteFactory.deepMerge(INSANITE_DEFAULTS, {}), TEMPLATE)
+    local model = InsanitePlanner.buildModel(DA)
+    local need = InsanitePlanner.computeNeeds(model)
+    for _, res in ipairs({ "cyanite", "benitoite", "uranium", "water" }) do
+        check(InsanitePlanner.isRaw(model, res), res .. " is raw stock")
+    end
+    check(model.autocrafted.netherite_block and not InsanitePlanner.isRaw(model, "insanite"),
+        "netherite blocks are an autocrafted prerequisite; insanite is a product")
+
+    local function planned(over)
+        local stock = {}
+        for res in pairs(model.resources) do stock[res] = 0 end
+        for k, v in pairs(over) do stock[k] = v end
+        local actions, notes = InsanitePlanner.plan(DA, model, need, { stock = stock, pending = {}, busy = {}, running = {},
+            crafting = {}, craftable = {} })
+        local by = {}
+        for _, a in ipairs(actions) do by[a.process.id] = a.ops end
+        return by, notes
+    end
+    local by, notes = planned({ water = 1e9 })
+    check(by["craft blutonium"] == nil and by["craft cyanite_fluid"] == nil and notes["craft blutonium"] == "needs cyanite",
+        "no cyanite in ME: AE2 blutonium and liquid cyanite wait for it (" .. tostring(notes["craft blutonium"]) .. ")")
+    by, notes = planned({ cyanite = 20 })
+    check(by["craft blutonium"] == nil and notes["craft blutonium"] == "needs water",
+        "no water in ME: the blutonium craft waits too (" .. tostring(notes["craft blutonium"]) .. ")")
+    local n = InsanitePlanner.blockCraft(DA, model, { insanite = 16, inanite = 16, netherite_block = 0 }, {})
+    check(n == 2, "netherite blocks never hold back the block craft")
+
+    -- The status screen: netherite blocks aren't monitored, cyanite is listed as raw.
+    _G.__simClock = 0
+    local W = newWorld()
+    stockUp(W)
+    W.me.item[id("cyanite")] = 3
+    runWorld(W, 10, nil, { plantText = TEMPLATE_TEXT })
+    local netheriteRow, cyaniteRow, rawRows = nil, nil, {}
+    for _, l in ipairs(InsaniteFactory.statusLines()) do
+        if l.text:find("^Netherite") then netheriteRow = l.text end
+        if l.text:find("^Cyanite ") then cyaniteRow = l end
+        if l.text:find("raw$") then rawRows[#rawRows + 1] = (l.text:match("^(%S+)")) end
+    end
+    check(netheriteRow == nil, "no Netherite Blk row on the status screen")
+    check(cyaniteRow and cyaniteRow.text:find("raw$") and cyaniteRow.color == colors.red,
+        "cyanite row reads raw, red under one block's worth: " .. tostring(cyaniteRow and cyaniteRow.text))
+    check(table.concat(rawRows, ",") == "Benitoite,Cyanite,Uranium,Water", "raw rows: " .. table.concat(rawRows, ", "))
 end
 
 --endregion
@@ -1539,7 +1615,7 @@ do
         "yellow title bar: " .. text(mon, top, x1))
     local body = {}
     for y = top + 1, 45 do body[#body + 1] = text(mon, y, x1):gsub("^%s+", "") end
-    check(table.concat(body, " "):find("KIT FULL, but AE2 can't craft Insanite Blks: ME has no Netherite Blk", 1, true),
+    check(table.concat(body, " "):find("AE2 REFUSED the Insanite Blk craft", 1, true),
         "the alert text is in the window: " .. table.concat(body, " "))
     check(cell(mon, x1 - 1, 45).bg ~= colors.red, "nothing outside the window turns red")
     check(cell(mon, 10, 1).bg == colors.gray and cell(mon, 1, 2).bg ~= colors.red and text(mon, 2):find("Insanite factory", 1, true),
