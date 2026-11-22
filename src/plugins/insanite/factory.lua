@@ -11,6 +11,11 @@
 -- If a load comes up short, or contents sit unchanged for stallSeconds, the short input is
 -- topped up to a whole number of operations (nothing is ever pulled back out).
 --
+-- Two stop buttons (top row of the status monitor), each on its own:
+--   reactors: "ratio" reactors (R5 + R7) held at 100% rods; "stock" reactors (R6 + R8) keep running.
+--   machines: nothing loaded into the batch machines (not even stall top-ups).
+-- AE2 crafts only stock ME and aren't affected by either. Both survive reboots (pauseFile).
+--
 -- Runs beside the core controller (see hook.lua). Every peripheral call is pcall-guarded and
 -- a failed cycle is logged and retried, so a plugin fault cannot stop reactor control.
 
@@ -31,6 +36,10 @@ local cycleCount = 0
 local lastError = nil
 local bootMessage = nil
 local plantWarnings = {}     -- non-fatal plant config problems, shown on the status screen
+local stopped = { reactors = false, machines = false } -- the two stop buttons
+local heldReactors = {}      -- reactorId -> true: what the reactor stop holds fully inserted
+local buttonAt = {}          -- drawn buttons: { key, y, x1, x2 }
+local lastTap = {}           -- button key -> clock of its last toggle (debounce)
 
 local unpack = table.unpack or unpack
 
@@ -341,7 +350,7 @@ local function observeMachine(name, m)
     local window = cfg.stallSeconds or 60
     if st.process and now() - (st.changedAt or now()) >= window then
         st.stalled = true
-        if now() - (st.repairAt or -math.huge) >= window then
+        if not stopped.machines and now() - (st.repairAt or -math.huge) >= window then
             st.repairAt = now()
             local p = model.byId[st.process]
             local ops = impliedOps(p, contents)
@@ -363,21 +372,42 @@ local function busyReason(st)
     return nil
 end
 
+-- Loads p into its (empty) machine. Returns the operations loaded, or 0 and the missing input.
 local function runBatch(p, ops)
     local m = cfg.machines[p.machine]
     local st = machineState[p.machine] or {}
     machineState[p.machine] = st
 
-    -- First input sets how many operations actually happen; later inputs are sized to match.
-    local moved, opsDone = {}, ops
+    -- Re-read ME right before loading (an importer may have taken something since the cycle
+    -- started): only whole operations that EVERY input is there for, or nothing at all.
+    local spare, order = {}, {}
     for i, inp in ipairs(p.inputs) do
-        local def = cfg.resources[inp.res]
-        moved[i] = exportTo(def, m.ports[inp.port], opsDone * inp.qty)
-        if i == 1 then
+        spare[i] = math.floor(meAmount(cfg.resources[inp.res]) / inp.qty)
+        order[i] = i
+        if spare[i] < ops then ops = spare[i] end
+    end
+    if ops < 1 then
+        local short = p.inputs[1].res
+        for i, inp in ipairs(p.inputs) do if spare[i] < 1 then short = inp.res end end
+        event("%s: %s not started, ME has no %s now", p.machine, p.id, short)
+        return 0, short
+    end
+
+    -- Scarcest input first: it sets how many operations actually happen and the rest are sized
+    -- to match, so if it can't be moved nothing has been loaded.
+    table.sort(order, function(a, b)
+        if spare[a] ~= spare[b] then return spare[a] < spare[b] end
+        return a < b
+    end)
+    local moved, opsDone = {}, ops
+    for n, i in ipairs(order) do
+        local inp = p.inputs[i]
+        moved[i] = exportTo(cfg.resources[inp.res], m.ports[inp.port], opsDone * inp.qty)
+        if n == 1 then
             opsDone = math.ceil(moved[i] / inp.qty)
             if opsDone == 0 then
-                event("%s: could not load %s", p.machine, inp.res)
-                return
+                event("%s: %s not started, could not load %s", p.machine, p.id, inp.res)
+                return 0, inp.res
             end
         end
     end
@@ -397,6 +427,7 @@ local function runBatch(p, ops)
     st.process, st.ops, st.busy, st.stalled = p.id, implied, true, false
     st.sig, st.changedAt = nil, now()
     event("%s <- %s x%d", p.machine, p.id, implied)
+    return implied
 end
 
 --endregion
@@ -474,6 +505,74 @@ end
 
 --endregion
 
+--region stop buttons (status monitor)
+
+-- Reactors the reactor stop holds: every "ratio" reactor. "stock" reactors (R6 + R8) keep
+-- running and "power" reactors stay on the core's energy control.
+local function stoppableReactors()
+    local out = {}
+    for id, r in pairs(cfg.reactors or {}) do
+        if r and (r.rodControl or "ratio") == "ratio" then out[id] = true end
+    end
+    return out
+end
+
+local function reactorList(mode)
+    local ids = {}
+    for id, r in pairs(cfg.reactors or {}) do
+        if r and (r.rodControl or "ratio") == mode then ids[#ids + 1] = shortId(id) end
+    end
+    table.sort(ids)
+    return #ids > 0 and table.concat(ids, "+") or "none"
+end
+
+-- Hand the hold to the rod law (and make sure the law is installed, even if the ME Bridge is
+-- gone this cycle).
+local function applyStops()
+    heldReactors = stopped.reactors and stoppableReactors() or {}
+    if _G.InsaniteRods then
+        InsaniteRods.setHeld(heldReactors)
+        if InsaniteRods.enabled() then InsaniteRods.install() end
+    end
+end
+
+local STOP_LABEL = { reactors = "reactors", machines = "machine loading" }
+
+local function setStopped(key, on, why)
+    if STOP_LABEL[key] == nil then error("unknown stop button " .. tostring(key), 2) end
+    stopped[key] = on == true
+    if cfg.pauseFile then
+        if stopped.reactors or stopped.machines then
+            writeTableFile(cfg.pauseFile, { reactors = stopped.reactors, machines = stopped.machines })
+        elseif fs.exists(cfg.pauseFile) then
+            fs.delete(cfg.pauseFile)
+        end
+    end
+    applyStops()
+    local label = key == "reactors" and (reactorList("ratio") .. " reactors") or STOP_LABEL[key]
+    event("%s %s (%s)", label, stopped[key] and "STOPPED" or "STARTED", why)
+    print("Insanite: " .. label .. " " .. (stopped[key] and "STOPPED" or "STARTED") .. " (" .. why .. ")")
+end
+
+-- A tap on the status monitor. Each button toggles its own stop; a repeat tap on the same button
+-- within a second is ignored (a held click can fire twice). Returns true if something toggled.
+function Factory.touch(name, x, y)
+    if not cfg or not cfg.monitor or name ~= cfg.monitor then return false end
+    for _, b in ipairs(buttonAt) do
+        if y == b.y and x >= b.x1 and x <= b.x2 then
+            if lastTap[b.key] and now() - lastTap[b.key] < 1 then return false end
+            lastTap[b.key] = now()
+            setStopped(b.key, not stopped[b.key], "monitor button")
+            return true
+        end
+    end
+    return false
+end
+function Factory.setStopped(key, on) setStopped(key, on, "command") end
+function Factory.stopped() return { reactors = stopped.reactors, machines = stopped.machines } end
+
+--endregion
+
 --region alerts
 
 local alerts = {}           -- key -> { text, since, lastSeen }
@@ -513,7 +612,9 @@ local function buildAlerts(notes)
     end
     if slowedNow then slowAt = math.min(1, slowAt + 0.10) end
     local causeless = false
-    if d and d.unconstrained > 0 and d.rate < d.unconstrained * slowAt then
+    -- (no slowdown alerts while a stop button is on: the plant is held on purpose)
+    if not stopped.reactors and not stopped.machines
+        and d and d.unconstrained > 0 and d.rate < d.unconstrained * slowAt then
         local pct = math.floor(d.rate / d.unconstrained * 100 + 0.5)
         if d.limitKind == "overflow" then
             local cov = (d.pools[d.limitId] or {}).cov or 0
@@ -551,7 +652,9 @@ local function buildAlerts(notes)
         local floor = r and 0.1 * plantRate * r.share or 0
         local measuredBurn = e.measured or 0
         local off = (e.target and e.target > 0) and math.abs(measuredBurn - e.target) / math.max(e.target, floor) or 0
-        if e.stock then
+        if heldReactors[id] then
+            trackSince[id] = nil -- stopped on purpose
+        elseif e.stock then
             -- Stock reactors burn flat out by design; only an empty tank while filling is a fault.
             local pool = d and d.stockPools[r.pool]
             local info = reactorInfo[id] or {}
@@ -651,6 +754,21 @@ local function buildStatus()
     end
     local K = cfg.stockBlocks or 2
 
+    -- The two stop buttons, side by side on the top row (each half is its own touch target).
+    local held = reactorList("ratio")
+    local function button(key, runningText, stoppedText)
+        if stopped[key] then
+            return { key = key, text = stoppedText, color = colors.black, bg = colors.orange }
+        end
+        return { key = key, text = runningText, color = colors.white, bg = colors.gray }
+    end
+    local buttons = {
+        button("reactors", "[ STOP " .. held .. " ]", "[ " .. held .. " STOPPED - START ]"),
+        button("machines", "[ STOP MACHINE LOADING ]", "[ LOADING STOPPED - START ]"),
+    }
+    lines[#lines + 1] = { text = buttons[1].text .. "  " .. buttons[2].text, color = colors.white,
+        buttons = buttons }
+
     -- Alert banner: a full-width red band at the very top.
     if #alertOrder > 0 then
         add("", colors.white, colors.red)
@@ -663,6 +781,14 @@ local function buildStatus()
     add(string.format("Insanite factory  cycle %d   kit %.1f/%g blk   craftable now %d",
         cycleCount, kit, K, InsanitePlanner.craftableBlocks(model, lastStock)), colors.yellow)
     if lastError then add("last error: " .. lastError, colors.red) end
+    if stopped.reactors then
+        add(string.format("%s STOPPED by button: rods held at 100%% (%s keep running)", held,
+            reactorList("stock")), colors.orange, nil, true)
+    end
+    if stopped.machines then
+        add("Machine loading STOPPED by button: nothing goes into the reprocessor or fluidizer",
+            colors.orange, nil, true)
+    end
     if rateDetail then
         add(string.format("Plant %.1f of %.1f blk/h   limit: %s",
             rateDetail.rate * 72000, plantRate * 72000, shortId(rateDetail.limit)),
@@ -729,7 +855,8 @@ local function buildStatus()
     add("Machines", colors.lightGray)
     for name in pairs(cfg.machines or {}) do
         local st = machineState[name] or {}
-        add(string.format("%-12s %s", name, busyReason(st) or "idle"), st.stalled and colors.red or colors.white)
+        add(string.format("%-12s %s%s", name, busyReason(st) or "idle", stopped.machines and " (loading stopped)" or ""),
+            st.stalled and colors.red or (stopped.machines and colors.orange or colors.white))
     end
     for _, p in ipairs(model.processes) do
         if p.machine ~= "reactor" then
@@ -762,6 +889,9 @@ local function buildStatus()
                 local mode = _G.InsaniteRods and InsaniteRods.modeOf(id) or p.rodControl[id]
                 if not info.present then
                     note = "not connected"
+                elseif mode == "held" then
+                    note = "stopped (rods in)"
+                    dev = "    -"
                 elseif (info.fuelAmount or 0) < 1000 then
                     note = "out of fuel (ME importer?)"
                 elseif mode == "power" then
@@ -783,6 +913,7 @@ local function buildStatus()
                     rod.measured or 0, targetText, dev, note)
                 local color = colors.white
                 if rod.capacity or beyond then color = colors.orange end
+                if mode == "held" then color = colors.lightGray end
                 if sp then color = colors.cyan end -- flat out by design; a recorded max is normal
                 if alerts["track:" .. id] or rod.lastError then color = colors.red end
                 add(text, color)
@@ -837,6 +968,7 @@ local function render()
         if f then f.write(table.concat(text, "\n")); f.close() end
     end
 
+    buttonAt = {}
     if cfg.monitor then
         -- Claim the monitor from the core UI so the two don't draw over each other.
         if _G.monitors and _G.monitors[cfg.monitor] then _G.monitors[cfg.monitor] = nil end
@@ -850,6 +982,24 @@ local function render()
                 local y = 1
                 for _, l in ipairs(lines) do
                     local chunks = l.wrap and wrapText(l.text, width - 1, "      ") or { l.text }
+                    if l.buttons then
+                        -- Equal-width buttons, label centred, one blank column between them.
+                        local n = #l.buttons
+                        local w = math.floor((width - (n - 1)) / n)
+                        for i, b in ipairs(l.buttons) do
+                            local x1 = 1 + (i - 1) * (w + 1)
+                            local label = b.text:sub(1, w)
+                            local pad = w - #label
+                            local left = math.floor(pad / 2)
+                            mon.setCursorPos(x1, y)
+                            mon.setBackgroundColor(b.bg)
+                            mon.setTextColor(b.color)
+                            mon.write(string.rep(" ", left) .. label .. string.rep(" ", pad - left))
+                            buttonAt[#buttonAt + 1] = { key = b.key, y = y, x1 = x1, x2 = x1 + w - 1 }
+                        end
+                        chunks = {}
+                        y = y + 1
+                    end
                     for _, chunk in ipairs(chunks) do
                         mon.setCursorPos(1, y)
                         mon.setBackgroundColor(l.bg or colors.black)
@@ -901,6 +1051,10 @@ function Factory.init(extraOverrides)
     plantRate = InsanitePlanner.plantRate(cfg, model, opsPerBlock)
     rateTargets, rateDetail = {}, nil
     local rodsOn = _G.InsaniteRods and InsaniteRods.configure(cfg)
+    local saved = readTableFile(cfg.pauseFile) or {}
+    stopped = { reactors = saved.reactors == true, machines = saved.machines == true }
+    lastTap = {}
+    applyStops()
 
     local parts = {}
     for _, res in ipairs({ "uranium", "blutonium", "cyanite", "rossinite", "benitoite" }) do
@@ -911,6 +1065,10 @@ function Factory.init(extraOverrides)
     bootMessage = "Insanite plugin: per block " .. table.concat(parts, ", ")
         .. string.format("; max pace %.1f blocks/h%s", plantRate * 72000,
             rodsOn and ", reactors locked to recipe ratio" or "")
+        .. ((stopped.reactors or stopped.machines) and string.format(
+            "\nInsanite STOPPED by button:%s%s. Tap START on %s (or delete %s and reboot).",
+            stopped.reactors and (" " .. reactorList("ratio") .. " reactors") or "",
+            stopped.machines and " machine loading" or "", tostring(cfg.monitor), tostring(cfg.pauseFile)) or "")
     return cfg
 end
 
@@ -933,6 +1091,7 @@ end
 
 function Factory.cycle()
     cycleCount = cycleCount + 1
+    applyStops() -- before anything that can fail, so a reactor stop always holds
 
     if not wrap(cfg.bridge) then
         lastNotes = {}
@@ -958,10 +1117,12 @@ function Factory.cycle()
         if (need[res] or 0) > 0 then stock[res] = meAmount(def) end
     end
 
-    local pending, busy = {}, {}
+    local pending, busy, running = {}, {}, {}
     for name, m in pairs(cfg.machines or {}) do
         local st = observeMachine(name, m)
         busy[name] = busyReason(st)
+        if busy[name] then running[name] = st.process end
+        if stopped.machines then busy[name] = "loading stopped" end
         if st.process and st.contents then
             local p = model.byId[st.process]
             pending[p.output] = (pending[p.output] or 0) + impliedOps(p, st.contents) * p.outQty
@@ -979,6 +1140,7 @@ function Factory.cycle()
     if _G.InsaniteRods and InsaniteRods.enabled() then
         burnTarget, rateDetail = InsanitePlanner.rateTargets(cfg, model, need, opsPerBlock, stock,
             plantRate, InsaniteRods.capacities(), stockState)
+        for id in pairs(heldReactors) do burnTarget[id] = 0 end -- reactor stop: rods fully in
         local fullPace = {}
         for id, r in pairs(rateDetail.reactors) do fullPace[id] = plantRate * r.share end
         InsaniteRods.update(burnTarget, reactors, fullPace)
@@ -987,6 +1149,8 @@ function Factory.cycle()
     rateTargets = burnTarget
 
     -- 4. Plan batch-machine loads and AE2 craft requests (reactor fuel is the ME importer's job).
+    --    Machine stop: every batch machine counts as busy ("loading stopped"), so nothing is
+    --    loaded; AE2 crafts are still planned.
     local crafting, craftable = {}, {}
     for _, p in ipairs(model.processes) do
         if p.machine == "ae2" then
@@ -995,7 +1159,7 @@ function Factory.cycle()
         end
     end
     local actions, notes, projected = InsanitePlanner.plan(cfg, model, need, {
-        stock = stock, pending = pending, busy = busy, crafting = crafting, craftable = craftable,
+        stock = stock, pending = pending, busy = busy, running = running, crafting = crafting, craftable = craftable,
     })
 
     -- 5. Act.
@@ -1004,7 +1168,8 @@ function Factory.cycle()
         if p.machine == "ae2" then
             requestCraft(p, a.ops)
         else
-            runBatch(p, a.ops)
+            local loaded, short = runBatch(p, a.ops)
+            if loaded == 0 then notes[p.id] = "needs " .. tostring(short) .. " (gone before loading)" end
         end
     end
 
@@ -1127,7 +1292,16 @@ function Factory.runForever()
             event("error: %s", lastError)
             pcall(render)
         end
-        sleep(cfg.cycleSeconds or 5)
+        -- Wait for the next cycle; a tap on the pause button runs one straight away.
+        local timer = os.startTimer(cfg.cycleSeconds or 5)
+        while true do
+            local ev, a, b, c = os.pullEvent()
+            if ev == "timer" and a == timer then break end
+            if ev == "monitor_touch" and Factory.touch(a, b, c) then
+                pcall(render)
+                break
+            end
+        end
     end
 end
 

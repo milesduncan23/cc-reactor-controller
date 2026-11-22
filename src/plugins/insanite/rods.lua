@@ -19,6 +19,9 @@
 -- raised 2% per factory cycle so the plant probes back up; it's forgotten once the rods are
 -- well inserted again (the reactor clearly isn't the limit).
 --
+-- Reactor stop button (status monitor): the stopped reactors are "held": rods written fully in on
+-- every pass, regardless of targets, staleness or plugin errors, until the button is tapped again.
+--
 -- Burn targets come from InsaniteFactory every cycle. If they stop arriving for rodStaleSeconds
 -- (plugin stopped/erroring), every reactor falls back to the unmodified core law. An error inside
 -- the substituted law also falls back to the core law for that pass, so the plugin can never trip
@@ -35,6 +38,7 @@ local targets = {}   -- reactorId -> required burn, mB/t
 local scales = {}    -- reactorId -> its burn at full plant pace, mB/t (fallback step size)
 local noFuel = {}    -- reactorId -> true while the reactor has (almost) no fuel to burn
 local state = {}     -- reactorId -> { level, at, measured, k, capacity, satSince, mode, lastError }
+local held = {}      -- reactorId -> true while the reactor stop is on: rods fully in, no matter what
 local stampedAt = nil
 
 local function now() return os.clock() end
@@ -56,6 +60,7 @@ local function fresh()
 end
 
 local function modeOf(id)
+    if held[id] then return "held" end -- stopped: never falls back to the energy law
     if not fresh() then return "power" end
     return modes[id] or "power"
 end
@@ -164,6 +169,13 @@ local function managedUpdateRods(self)
         local st = state[self.id] or {}
         state[self.id] = st
         st.mode = mode
+        if mode == "held" then
+            st.measured = (self.averageFuelUsage or 0) * 1000
+            st.level, st.at, st.satSince = 100, now(), nil
+            writeRods(self, 100)
+            st.lastError = nil
+            return
+        end
         writeRods(self, ratioLaw(self, st, targets[self.id] or 0))
         st.lastError = nil
     end)
@@ -171,8 +183,12 @@ local function managedUpdateRods(self)
         local st = state[self.id] or {}
         state[self.id] = st
         st.lastError = tostring(err)
-        local law = coreLaw(self)
-        if law then law(self) end
+        if held[self.id] then
+            pcall(self.setRodLevels, 100) -- stopped stays stopped, even on an error
+        else
+            local law = coreLaw(self)
+            if law then law(self) end
+        end
     end
 end
 
@@ -183,7 +199,7 @@ function Rods.configure(cfg)
     settings.deadband = cfg.rodDeadband or settings.deadband
     settings.staleSeconds = cfg.rodStaleSeconds or settings.staleSeconds
     settings.capacitySeconds = cfg.capacitySeconds or settings.capacitySeconds
-    modes, state, targets, scales, noFuel, stampedAt = {}, {}, {}, {}, {}, nil
+    modes, state, targets, scales, noFuel, stampedAt, held = {}, {}, {}, {}, {}, nil, {}
     enabled = false
     for id, r in pairs(cfg.reactors or {}) do
         if r then
@@ -237,6 +253,9 @@ function Rods.install()
         end
     end
 end
+
+-- Reactors to hold fully inserted while the reactor stop is on ({ [id] = true }; {} = none).
+function Rods.setHeld(set) held = set or {} end
 
 function Rods.enabled() return enabled end
 function Rods.state(id) return state[id] end

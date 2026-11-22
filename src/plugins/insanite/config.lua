@@ -92,6 +92,7 @@ _G.INSANITE_DEFAULTS = {
     plantFile = "/insanite.conf",          -- device definitions (+ optional tuning overrides)
     statusFile = "/insanite/status.txt",
     stateFile = "/insanite/state.conf",
+    pauseFile = "/insanite/paused",        -- which stop buttons are on (exists while any is)
 
     -- Every item/fluid the factory touches. kind = "item" (counted in items) or "fluid" (mB).
     resources = {
@@ -170,7 +171,10 @@ _G.INSANITE_DEFAULTS = {
           inputs = { { res = "ludicrite", qty = 2, port = "solid" }, { res = "magentite_fluid", qty = 1000, port = "fluid" } } },
         { id = "ludicrite", machine = "reprocessor", output = "ludicrite", outQty = 1,
           inputs = { { res = "blutonium", qty = 2, port = "solid" }, { res = "cyanite_fluid", qty = 1000, port = "fluid" } } },
-        { id = "blutonium", machine = "reprocessor", output = "blutonium", outQty = 1,
+        -- priority: planned before every other recipe, and while it's below target (reprocessor
+        -- free or already on blutonium) it holds its cyanite, so the liquid-cyanite craft can't
+        -- take single ingots it is waiting to pair up.
+        { id = "blutonium", machine = "reprocessor", output = "blutonium", outQty = 1, priority = true,
           inputs = { { res = "cyanite", qty = 2, port = "solid" }, { res = "water", qty = 1000, port = "fluid" } } },
         { id = "verderium", machine = "fluidizer", output = "verderium", outQty = 2000,
           inputs = { { res = "uranium", qty = 2, port = "a" }, { res = "blutonium", qty = 1, port = "b" } } },

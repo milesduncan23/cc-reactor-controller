@@ -130,6 +130,7 @@ local function newWorld(opts)
     opts = opts or {}
     peripheral._registry = {}
     fs.delete(D.stateFile)
+    fs.delete(D.pauseFile)
 
     local W = { me = { item = {}, fluid = {} },
         stats = { mixed = 0, stuck = 0, badCrafts = 0, badFilters = 0, crafted = 0, craftRequests = {}, craftDuplicates = 0 } }
@@ -716,7 +717,8 @@ end
 print("ratio mode: R6 + R8 locked with R5 and R7 (216:16:24)")
 do
     _G.__simClock = 0
-    local W = newWorld()
+    -- Equal-strength R6 + R8 so the split itself is measured (the weak-R8 case is tested above).
+    local W = newWorld({ maxBurn = { [R8] = 60 } })
     stockUp(W)
     runWorld(W, 4 * 3600, {}, { craftEvery = 400, plantText = PLANT_TEXT_RATIO })
     local ok, ratio = burnRatioOk(W, 0.10)
@@ -807,6 +809,241 @@ end
 
 --endregion
 
+--region 8b. loading: all inputs or nothing; blutonium first
+
+print("batch loads: every input in ME or nothing loaded; scarcest input goes in first")
+do
+    local fz = D.machines.fluidizer.ports
+    local function fluidizerWorld(blutonium)
+        _G.__simClock = 0
+        -- R5's importer off, so the blutonium sits in ME until the test takes it.
+        local W = newWorld({ noImporter = { [R5] = true } })
+        stockUp(W)
+        W.me.item[id("blutonium")] = blutonium
+        W.me.fluid[id("verderium")] = 0
+        W.loads = {}
+        local bridge = peripheral._registry[D.bridge].methods
+        local realExport = bridge.exportItem
+        bridge.exportItem = function(t, f)
+            local n = realExport(t, f)
+            if t == fz.a or t == fz.b then W.loads[#W.loads + 1] = f.name .. " x" .. tostring(n) end
+            return n
+        end
+        return W
+    end
+    local function held()
+        return #peripheral._registry[fz.a].methods.list() + #peripheral._registry[fz.b].methods.list()
+    end
+
+    -- Something (e.g. R5's importer) takes the blutonium between the plugin reading ME and loading.
+    local W = fluidizerWorld(1)
+    local realPlan = InsanitePlanner.plan
+    InsanitePlanner.plan = function(...)
+        local actions, notes, projected = realPlan(...)
+        W.me.item[id("blutonium")] = 0
+        return actions, notes, projected
+    end
+    runWorld(W, D.cycleSeconds)
+    InsanitePlanner.plan = realPlan
+    check(held() == 0 and #W.loads == 0,
+        "blutonium gone before loading -> nothing exported, fluidizer left empty (" .. table.concat(W.loads, ", ") .. ")")
+    check(InsaniteFactory.lastNotes().verderium == "needs blutonium (gone before loading)",
+        "status says why: " .. tostring(InsaniteFactory.lastNotes().verderium))
+
+    -- Loading order: the input ME has the fewest operations' worth of goes in first.
+    W = fluidizerWorld(3)
+    runWorld(W, D.cycleSeconds)
+    check(W.loads[1] == id("blutonium") .. " x3" and W.loads[2] == id("uranium") .. " x6",
+        "fluidizer: blutonium (scarce) loaded before uranium: " .. table.concat(W.loads, ", "))
+    check(held() == 2, "and both injectors hold their share")
+end
+
+print("blutonium recipe first: holds its cyanite from the liquid-cyanite craft")
+do
+    local model = InsanitePlanner.buildModel(D)
+    local need = InsanitePlanner.computeNeeds(model)
+    local function snap(cyanite, extra)
+        local stock = {}
+        for res in pairs(model.resources) do stock[res] = 0 end
+        stock.cyanite, stock.water = cyanite, 1e9
+        local sn = { stock = stock, pending = {}, busy = {}, running = {}, crafting = {}, craftable = {} }
+        for k, v in pairs(extra or {}) do
+            if k == "stock" then for r, a in pairs(v) do stock[r] = a end else sn[k] = v end
+        end
+        return sn
+    end
+    local function planned(sn)
+        local actions, notes = InsanitePlanner.plan(D, model, need, sn)
+        local by = {}
+        for _, a in ipairs(actions) do by[a.process.id] = a.ops end
+        return by, notes
+    end
+
+    local by, notes = planned(snap(1))
+    check(by["craft cyanite_fluid"] == nil and by.blutonium == nil, "1 cyanite, reprocessor free: nothing takes it")
+    check(notes["craft cyanite_fluid"] == "needs cyanite (held for blutonium)", "status: " .. tostring(notes["craft cyanite_fluid"]))
+
+    by = planned(snap(2))
+    check(by.blutonium == 1 and by["craft cyanite_fluid"] == nil, "2 cyanite: blutonium x1, craft gets none")
+
+    local fullLoad = InsanitePlanner.machineCapacityOps(D, D.machines.reprocessor, model.byId.blutonium)
+    by = planned(snap(2 * fullLoad + 3))
+    check(by.blutonium == fullLoad and by["craft cyanite_fluid"] == 3,
+        string.format("%d cyanite: a full blutonium load (x%d), the craft gets the 3 left over", 2 * fullLoad + 3, fullLoad))
+
+    by, notes = planned(snap(1, { busy = { reprocessor = "running blutonium" }, running = { reprocessor = "blutonium" } }))
+    check(by["craft cyanite_fluid"] == nil, "reprocessor running blutonium: still held (" .. tostring(notes["craft cyanite_fluid"]) .. ")")
+
+    by = planned(snap(1, { busy = { reprocessor = "running ludicrite" }, running = { reprocessor = "ludicrite" } }))
+    check(by["craft cyanite_fluid"] == 1, "reprocessor busy on another recipe: the craft may use it")
+
+    by = planned(snap(1, { stock = { blutonium = D.stockBlocks * need.blutonium } }))
+    check(by["craft cyanite_fluid"] == 1, "blutonium at target: the craft may use it")
+
+    -- Ludicrite is further behind than blutonium here, but blutonium still goes in first.
+    by = planned(snap(2, { stock = { blutonium = 100, cyanite_fluid = 64000 } }))
+    check(by.blutonium == 1 and by.ludicrite == nil, "reprocessor free: blutonium before a further-behind recipe")
+    by = planned(snap(1, { stock = { blutonium = 100, cyanite_fluid = 64000 } }))
+    check(by.ludicrite and by.ludicrite >= 1, "blutonium short of a load: the reprocessor runs ludicrite meanwhile")
+end
+
+--endregion
+
+--region 8c. stop buttons
+
+print("stop buttons: one stops R5 + R7, the other stops machine loading; each on its own")
+do
+    _G.__simClock = 0
+    local W = newWorld()
+    stockUp(W)
+    local mon = makeTerm(70, 200)
+    peripheral.register("monitor_3", "monitor", mon)
+    local function row(y)
+        local out = {}
+        for x = 1, mon._w do out[#out + 1] = (mon._grid[y][x] or { ch = " " }).ch end
+        return (table.concat(out):gsub("%s+$", ""))
+    end
+    -- 70 columns: reactor button 1-34, blank column 35, machine button 36-69.
+    local REACTORS_X, GAP_X, MACHINES_X = 10, 35, 50
+    local touch, stopped = InsaniteFactory.touch, InsaniteFactory.stopped
+    -- Count everything put into the reprocessor / fluidizer.
+    local machinePorts = {}
+    for _, m in pairs(D.machines) do for _, name in pairs(m.ports) do machinePorts[name] = true end end
+    local loads = 0
+    local bridge = peripheral._registry[D.bridge].methods
+    for _, method in ipairs({ "exportItem", "exportFluid" }) do
+        local real = bridge[method]
+        bridge[method] = function(t, f)
+            local n = real(t, f)
+            if machinePorts[t] and (tonumber(n) or 0) > 0 then loads = loads + 1 end
+            return n
+        end
+    end
+    local function crafts()
+        local n = 0
+        for _, v in pairs(W.stats.craftRequests) do n = n + v end
+        return n
+    end
+    local function burned(rid) return W.reactors[rid].burnedTotal end
+    local function hasAlert(prefix)
+        for _, a in ipairs(InsaniteFactory.alerts()) do if a.key:find(prefix, 1, true) == 1 then return true end end
+        return false
+    end
+    local function statusHas(text)
+        for _, l in ipairs(InsaniteFactory.statusLines()) do if l.text:find(text, 1, true) then return l.text end end
+        return nil
+    end
+
+    runWorld(W, 600, nil, { craftEvery = 400 })
+    check(row(1):find("[ STOP R5+R7 ]", 1, true) and row(1):find("[ STOP MACHINE LOADING ]", 1, true),
+        "top row holds two buttons: " .. row(1))
+    check(mon._grid[1][REACTORS_X].bg == colors.gray and mon._grid[1][GAP_X] == nil and mon._grid[1][MACHINES_X].bg == colors.gray,
+        "two separate blocks with a blank column between them")
+    check(loads > 0, "running: the machines get loaded (" .. loads .. " loads)")
+    check(not touch("monitor_3", GAP_X, 1) and not touch("monitor_3", REACTORS_X, 4) and not touch("monitor_2", REACTORS_X, 1)
+        and not stopped().reactors and not stopped().machines, "taps on the gap, another row or another monitor do nothing")
+
+    -- 1. Reactor button only.
+    check(touch("monitor_3", REACTORS_X, 1) and stopped().reactors and not stopped().machines,
+        "reactor button -> R5 + R7 stopped, machine loading untouched")
+    check(not touch("monitor_3", REACTORS_X, 1) and stopped().reactors, "a second tap within 1 s (double-fired click) is ignored")
+    check(fs.exists(D.pauseFile), "saved to " .. D.pauseFile)
+    runWorld(W, 10, nil, { continue = true })
+    local before = { r5 = burned(R5), r7 = burned(R7), r6 = burned(R6), r8 = burned(R8) }
+    local loads0 = loads
+    runWorld(W, 600, nil, { continue = true, craftEvery = 400 })
+    check(W.reactors[R5].rod == 100 and W.reactors[R7].rod == 100, "R5 + R7 rods at exactly 100%")
+    check(burned(R5) == before.r5 and burned(R7) == before.r7, "R5 + R7 burn nothing")
+    check(burned(R6) > before.r6 and burned(R8) > before.r8, string.format(
+        "R6 + R8 keep burning (%.0f + %.0f mB in 10 min)", burned(R6) - before.r6, burned(R8) - before.r8))
+    check(loads > loads0, "machines still loaded (" .. (loads - loads0) .. " loads)")
+    check(row(1):find("[ R5+R7 STOPPED - START ]", 1, true) and row(1):find("[ STOP MACHINE LOADING ]", 1, true),
+        "only the reactor button changed: " .. row(1))
+    check(mon._grid[1][REACTORS_X].bg == colors.orange and mon._grid[1][MACHINES_X].bg == colors.gray, "stopped button turns orange")
+    check(statusHas("stopped (rods in)"), "reactor rows say stopped: " .. tostring(statusHas("stopped (rods in)")))
+    check(not hasAlert("track:") and not hasAlert("overflow") and not hasAlert("capacity:"),
+        "the stop raises no slowdown or off-target alerts")
+
+    -- 2. Machine button as well.
+    check(touch("monitor_3", MACHINES_X, 1) and stopped().machines and stopped().reactors, "machine button -> loading stopped too")
+    runWorld(W, 10, nil, { continue = true })
+    loads0 = loads
+    runWorld(W, 600, nil, { continue = true, craftEvery = 400 })
+    check(loads == loads0, "nothing loaded into the reprocessor or fluidizer (not even stall top-ups)")
+    check(InsaniteFactory.lastNotes().blutonium == "reprocessor loading stopped",
+        "recipes say why: " .. tostring(InsaniteFactory.lastNotes().blutonium))
+    check(row(1):find("[ LOADING STOPPED - START ]", 1, true), "machine button shows stopped: " .. row(1))
+
+    -- Reboot with both on: both still on.
+    InsaniteFactory.init()
+    InsaniteFactory.cycle()
+    check(stopped().reactors and stopped().machines and W.reactors[R5].rod == 100, "a reboot keeps both stops")
+
+    -- ME Bridge gone and no more cycles: R5 + R7 still held, though the core wants them out for power.
+    local savedBridge = peripheral._registry[D.bridge]
+    peripheral._registry[D.bridge] = nil
+    InsaniteFactory.cycle()
+    W.reactors[R5].core.powerWant, W.reactors[R7].core.powerWant = 0, 0
+    for _ = 1, 3 * D.rodStaleSeconds do W.t = W.t + 1; _G.__simClock = _G.__simClock + 1; W.step() end
+    check(W.reactors[R5].rod == 100 and W.reactors[R7].rod == 100,
+        "no bridge + targets stale for 3 min: R5 + R7 still fully in (no fallback to energy control)")
+    peripheral._registry[D.bridge] = savedBridge
+    W.reactors[R5].core.powerWant, W.reactors[R7].core.powerWant = 100, 100
+
+    -- 3. Reactors back on, loading still stopped.
+    InsaniteFactory.cycle()
+    check(touch("monitor_3", REACTORS_X, 1) and not stopped().reactors and stopped().machines,
+        "reactor button again -> R5 + R7 back on, loading still stopped")
+    before.r5, before.r7, loads0 = burned(R5), burned(R7), loads
+    runWorld(W, 600, nil, { continue = true })
+    check(burned(R5) > before.r5 and burned(R7) > before.r7, "R5 + R7 burn again")
+    check(loads == loads0, "while the machines still get nothing")
+    -- AE2 crafts only stock ME: neither button stops them.
+    W.me.fluid[id("cyanite_fluid")] = 0
+    W.me.item[id("cyanite")] = 200
+    local crafts0 = crafts()
+    runWorld(W, 60, nil, { continue = true })
+    check(crafts() > crafts0, "AE2 crafts still requested with loading stopped")
+
+    -- 4. Loading back on.
+    check(touch("monitor_3", MACHINES_X, 1) and not stopped().machines and not fs.exists(D.pauseFile),
+        "machine button again -> loading back on, nothing stopped, file removed")
+    loads0 = loads
+    runWorld(W, 600, nil, { continue = true, craftEvery = 400 })
+    check(loads > loads0, "machines get loaded again")
+    check(row(1):find("[ STOP R5+R7 ]", 1, true) and row(1):find("[ STOP MACHINE LOADING ]", 1, true), "both buttons back to STOP")
+
+    -- The real wait loop: a tap is handled at once (next cycle runs straight away).
+    os.queueEvent("monitor_touch", "monitor_3", MACHINES_X, 1)
+    local ok, err = pcall(InsaniteFactory.runForever)
+    check(not ok and tostring(err):find("empty queue", 1, true) and stopped().machines and not stopped().reactors,
+        "runForever: a monitor_touch on a button acts without waiting for the timer")
+    InsaniteFactory.setStopped("machines", false)
+    check(not stopped().machines and not fs.exists(D.pauseFile), "cleanup: everything running")
+end
+
+--endregion
+
 --region 9. ratio deviation + alerts
 
 print("ratio deviation vs the reference reactor (ratio mode)")
@@ -864,7 +1101,8 @@ do
     check(text ~= nil and text:find("insanite needs benitoite", 1, true) ~= nil, "alert: " .. tostring(text))
     check(scada["insanite:overflow"] ~= nil, "same alert raised in the core alarm list (SCADA)")
     local lines = InsaniteFactory.statusLines()
-    check(lines[1].bg == colors.red and lines[2].text:find("ALERT") ~= nil, "red alert banner at the top of the screen")
+    check(lines[1].buttons and lines[2].bg == colors.red and lines[3].text:find("ALERT") ~= nil,
+        "red alert banner at the top of the screen, right under the stop buttons")
 
     W.me.item[id("benitoite")] = 10000
     runWorld(W, 3 * 3600, nil, { continue = true })

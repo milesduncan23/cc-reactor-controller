@@ -259,10 +259,17 @@ end
 --   stock     = { [res] = amount in ME (exportable) },
 --   pending   = { [res] = amount inside batch machines, on its way to ME },
 --   busy      = { [machineName] = reason string or nil },
+--   running   = { [machineName] = process id it holds, while busy },
 --   crafting  = { [res] = true while an AE2 job for it is running },
 --   craftable = { [res] = false when AE2 has no pattern for it },
 -- }
 -- Returns actions (list of { process, ops }), notes ({ [processId] = state text }), projected.
+--
+-- A job is only planned for whole operations ME holds EVERY input for. Priority recipes
+-- (priority = true in the recipe, e.g. blutonium) go before everything else, and while one is
+-- below target and its machine is free or already running it, it holds its inputs (up to one
+-- full load) even when there isn't enough yet for one operation: lower-priority recipes and AE2
+-- crafts only get what's left over.
 function Planner.plan(cfg, model, need, snap)
     local avail, projected = {}, {}
     for res in pairs(model.resources) do
@@ -270,7 +277,7 @@ function Planner.plan(cfg, model, need, snap)
         projected[res] = avail[res] + ((snap.pending or {})[res] or 0)
     end
 
-    local candidates, notes = {}, {}
+    local candidates, notes, holds = {}, {}, {}
 
     for _, p in ipairs(model.processes) do
         if p.machine ~= "reactor" then
@@ -297,6 +304,10 @@ function Planner.plan(cfg, model, need, snap)
                     notes[p.id] = "machine not configured"
                 elseif (snap.busy or {})[p.machine] then
                     notes[p.id] = p.machine .. " " .. snap.busy[p.machine]
+                    -- Already running a priority recipe: it keeps first claim on its inputs.
+                    if p.priority and (snap.running or {})[p.machine] == p.id and cand.wanted > 0 then
+                        holds[#holds + 1] = { p = p, ops = math.min(cand.wanted, Planner.machineCapacityOps(cfg, m, p)) }
+                    end
                 else
                     cand.cap = Planner.machineCapacityOps(cfg, m, p)
                 end
@@ -313,9 +324,23 @@ function Planner.plan(cfg, model, need, snap)
     end
 
     table.sort(candidates, function(a, b)
+        if (a.p.priority and true or false) ~= (b.p.priority and true or false) then return a.p.priority == true end
         if a.cov ~= b.cov then return a.cov < b.cov end
         return a.p.order < b.p.order
     end)
+
+    -- Held inputs are out of reach for everything planned after the recipe holding them.
+    local heldFor = {}
+    local function hold(p, ops)
+        for _, inp in ipairs(p.inputs) do
+            local k = math.min(avail[inp.res] or 0, ops * inp.qty)
+            if k > 0 then
+                avail[inp.res] = avail[inp.res] - k
+                heldFor[inp.res] = heldFor[inp.res] or p.id
+            end
+        end
+    end
+    for _, h in ipairs(holds) do hold(h.p, h.ops) end
 
     local actions, taken = {}, {}
     for _, c in ipairs(candidates) do
@@ -324,13 +349,13 @@ function Planner.plan(cfg, model, need, snap)
         if exclusive and taken[p.machine] then
             notes[p.id] = "waiting (" .. p.machine .. " -> " .. taken[p.machine] .. ")"
         else
-            local ops = math.min(c.wanted, c.cap)
+            local full = math.min(c.wanted, c.cap)
             local short, shortOps = nil, HUGE
             for _, inp in ipairs(p.inputs) do
                 local canDo = math.floor((avail[inp.res] or 0) / inp.qty)
                 if canDo < shortOps then short, shortOps = inp.res, canDo end
             end
-            ops = math.min(ops, shortOps)
+            local ops = math.min(full, shortOps)
             if ops >= 1 then
                 for _, inp in ipairs(p.inputs) do
                     avail[inp.res] = avail[inp.res] - ops * inp.qty
@@ -344,9 +369,13 @@ function Planner.plan(cfg, model, need, snap)
                 else
                     notes[p.id] = "start x" .. ops
                 end
+            elseif heldFor[short] and heldFor[short] ~= p.id then
+                notes[p.id] = "needs " .. tostring(short) .. " (held for " .. heldFor[short] .. ")"
             else
                 notes[p.id] = "needs " .. tostring(short)
             end
+            -- A priority recipe holds what it would still load, even short of one operation.
+            if p.priority then hold(p, full - math.max(ops, 0)) end
         end
     end
 

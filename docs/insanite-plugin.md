@@ -65,14 +65,34 @@ always contains the chain in recipe ratio. The status screen shows each material
 Every 5 s, every product below target that has inputs available becomes a candidate. Candidates
 are sorted by coverage, lowest first, so:
 
-- The single reprocessor always runs the recipe whose product is furthest behind.
-- Scarce shared inputs (cyanite feeds the blutonium recipe and the liquid-cyanite craft;
-  blutonium feeds the reprocessor and the fluidizer; rossinite feeds two reprocessor recipes) go
-  to whichever consumer's product is furthest behind.
+- The single reprocessor runs the recipe whose product is furthest behind, except that the
+  **blutonium recipe always goes first** (see below).
+- Other scarce shared inputs (blutonium feeds the reprocessor and the fluidizer; rossinite feeds
+  two reprocessor recipes) go to whichever consumer's product is furthest behind.
 
-Loads are always whole operations into an empty machine, so recipes never mix. A short load is
+**Blutonium first.** The blutonium recipe is marked `priority = true` in `config.lua`. While
+blutonium is below target and the reprocessor is free or already running blutonium, the recipe
+is planned before everything else and **holds its cyanite** (up to one full load, 10 ingots),
+even when there's only one ingot and it needs two. The liquid-cyanite craft only gets cyanite
+beyond that: when more than a full load is waiting, when blutonium is at target, or while the
+reprocessor is busy with another recipe. The status screen shows the craft as
+`needs cyanite (held for blutonium)`. A held ingot doesn't block the reprocessor: it runs other
+recipes while blutonium waits for its pair.
+
+**All inputs or nothing.** A job is only planned for whole operations ME holds every input for.
+Just before loading, the plugin reads ME again (an importer may have taken something since the
+cycle began) and loads only what every input is still there for. It loads the scarcest input
+first (fluidizer: blutonium before uranium; reprocessor: cyanite before water), so if that one
+can't be moved, nothing has gone in. The status screen then says
+`needs blutonium (gone before loading)`.
+
+Loads are always whole operations into an empty machine, so recipes never mix. If a later input
+still comes up short (another device took it in the moment between the two exports), the load is
 topped up, and contents that sit unchanged for `stallSeconds` are treated as stalled and topped
 up to whole operations.
+
+None of this touches your ME importers: holds are only the plugin's own planning, nothing in ME
+is locked, and the importers can take anything at full speed.
 
 ## Reactors: one locked rate, plus a stock pool
 
@@ -174,7 +194,8 @@ Safety and fallbacks:
   and AE2 isn't already crafting it. The amount is the shortfall, at most `maxCraftItems` (64)
   ingots or `maxCraftFluid` (16 B) per request.
 - **Competing for cyanite:** the liquid-cyanite craft and the blutonium recipe both use cyanite
-  ingots. Whichever product is further behind gets them first, as with every shared input.
+  ingots. The blutonium recipe gets them first (see "Blutonium first" above); the craft gets what's
+  left over.
 - **Turning one off:** `autocraft.<name> = false` in `/insanite.conf`.
 - **Limit:** the allowlist is enforced in the model and again just before calling AE2, so nothing
   else can ever be requested, whatever the config says.
@@ -182,6 +203,30 @@ Safety and fallbacks:
   slowdown alert names it as the blocker.
 - **Different recipe ratio:** if your pattern converts at a different ratio than 1 ingot →
   1000 mB, change `crafts.<name>.outQty` / `inputs` in `/insanite.conf` so the ratios stay right.
+
+## Stop buttons
+
+The **top row of the status monitor** holds two separate buttons, side by side with a gap. Each
+one works on its own; tap it again to undo. A tap takes effect at once, without waiting for the
+next 5 s cycle. A repeat tap on the same button within a second is ignored, since a held click
+can fire twice.
+
+| Button (gray = running) | When tapped (orange) | What it stops |
+| --- | --- | --- |
+| `[ STOP R5+R7 ]` | `[ R5+R7 STOPPED - START ]` | Every `"ratio"` reactor (R5 + R7) held at **exactly 100% rods**. R6 + R8 (`"stock"`) keep running exactly as before, cap and uranium floor included. |
+| `[ STOP MACHINE LOADING ]` | `[ LOADING STOPPED - START ]` | **Nothing goes into the reprocessor or fluidizer**, not even the stall top-ups. A batch already inside finishes on its own; a half-loaded machine waits. |
+
+- **The reactor stop always holds.** It doesn't depend on the ME Bridge or on the plugin's cycle:
+  if the bridge disappears or a cycle errors, R5 + R7 stay fully in instead of falling back to the
+  core's energy control after `rodStaleSeconds`.
+- **AE2 crafts** (liquid cyanite, liquid magentite) only stock ME and load neither machine, so
+  neither button stops them.
+- **Your ME importers** are untouched by both.
+- **No alarms of their own:** while either stop is on there are no slowdown alerts, and R5 + R7
+  raise no off-target alerts while stopped. The screen shows an orange line for each stop that's
+  on, recipes read `reprocessor loading stopped`, and R5 + R7 read `stopped (rods in)`.
+- **Survives reboots:** saved in `/insanite/paused` (`pauseFile`). Without a status monitor there
+  are no buttons: delete that file and reboot to start everything again.
 
 ## Alerts and ratio deviation
 
@@ -324,13 +369,15 @@ tuning key that isn't a setting (`Did you mean stockBlocks?`).
 | `stockTaperPct` | 10 | A stock pool restarts once ME is this far below its cap |
 | `stockFuelResumePct` | 5 | After stopping at `stockFuelFloor`, a stock pool resumes once its fuel is this % above the floor |
 | `ejectWasteAbovePct` | 0 | >0 calls `doEjectWaste()` above this waste % |
+| `pauseFile` | `/insanite/paused` | Which stop buttons are on (exists while any is) |
 | `machines[name]` | see file | Capacities: `limits`, `opsPerTick` (ports come from `/insanite.conf`) |
 
 ## Status screen
 
 A 4×4 Advanced Monitor fits it (about 45 lines, 79 characters wide). It shows:
 
-- **Alert banner** (only when there are alerts): red, full width, at the top.
+- **Stop buttons:** the top row (see "Stop buttons").
+- **Alert banner** (only when there are alerts): red, full width, right under the buttons.
 - **Header:** kit coverage, how many blocks you could craft right now, and the plant rate vs max
   pace with what's limiting it (`kit reserve`, `kit full`, `R5 max burn`, `overflow rossinite`…).
 - **Resources:** ME stock, per-block need and coverage. Green = at target, orange = short, red =
@@ -406,6 +453,17 @@ The test checks:
   lock would allow, filling regardless of a weak R5, and R5:R7 staying at 16:24
 - ratio mode for R6 + R8 (still supported): the 216:16:24 lock end to end, an even split, and a
   weak R8 covered by R6 without slowing anything
+- batch loads: an input taken between reading ME and loading leaves the machine empty (no lone
+  uranium in the fluidizer), and the scarcest input is loaded first
+- blutonium first: one or two cyanite ingots are held from the liquid-cyanite craft while the
+  reprocessor is free or running blutonium; the craft gets only what's beyond a full load, or
+  everything once blutonium is at target or the reprocessor is busy on another recipe
+- stop buttons: two separate blocks on the top row (taps on the gap, other rows or other
+  monitors do nothing, a double-fired tap is ignored). The reactor button alone: R5 + R7 at
+  exactly 100% rods burning nothing, R6 + R8 still burning, machines still loaded, no alerts. The
+  machine button: nothing loaded, recipes say why, AE2 crafts still requested. Both survive a
+  reboot; R5 + R7 stay in with the ME Bridge gone and targets stale for 3 min; each undoes on its
+  own; the real wait loop reacts to a tap at once
 - AE2 crafts: only the two allowed are ever requested, with typed item/fluid filters, sized to
   the shortfall, never repeated while running, never when `autocraft` is false, and a missing
   pattern is shown and named as the blocker
