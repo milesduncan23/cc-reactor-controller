@@ -31,6 +31,8 @@ local reactorInfo = {}       -- reactorId -> last stats
 local lastEject = {}         -- reactorId -> clock
 local lastNotes, lastActions = {}, {}
 local lastStock, lastProjected = {}, {}
+local blocksInMe = nil       -- finished blocks (cfg.blockCraft) in ME, for the status screen
+local machineLoad = {}       -- machineName -> recent samples { t, limited, waiting = { processId... } }
 local events = {}
 local cycleCount = 0
 local lastError = nil
@@ -573,6 +575,53 @@ function Factory.stopped() return { reactors = stopped.reactors, machines = stop
 
 --endregion
 
+--region machine capacity
+
+-- One sample per cycle per batch machine: was ready work waiting for it (InsanitePlanner.plan's
+-- `waiting`)? Samples older than machineAlertSeconds are dropped. The machine button clears them.
+local function sampleMachines(waiting)
+    local window = cfg.machineAlertSeconds or 300
+    local t = now()
+    for name in pairs(cfg.machines or {}) do
+        local list = machineLoad[name] or {}
+        machineLoad[name] = list
+        local w = (waiting or {})[name]
+        list[#list + 1] = { t = t, limited = w ~= nil and #w > 0, waiting = w or {} }
+        while #list > 0 and t - list[1].t > window do table.remove(list, 1) end
+    end
+end
+
+-- How much of the window work waited for this machine: pct (0-100), whether the samples cover
+-- (nearly) the whole window yet, and the recipes that waited most often.
+local function machinePressure(name)
+    local list = machineLoad[name]
+    if not list or #list == 0 then return nil end
+    local limited, count = 0, {}
+    for _, smp in ipairs(list) do
+        if smp.limited then limited = limited + 1 end
+        for _, pid in ipairs(smp.waiting) do count[pid] = (count[pid] or 0) + 1 end
+    end
+    local pids = {}
+    for pid in pairs(count) do pids[#pids + 1] = pid end
+    table.sort(pids, function(a, b) if count[a] ~= count[b] then return count[a] > count[b] end return a < b end)
+    local window = cfg.machineAlertSeconds or 300
+    local covered = now() - list[1].t >= 0.9 * window
+    return math.floor(100 * limited / #list + 0.5), covered, pids
+end
+
+-- Machines currently at capacity: { [name] = { pct, waiting } }.
+local function machinesAtCapacity()
+    local out = {}
+    if stopped.machines then return out end
+    for name in pairs(cfg.machines or {}) do
+        local pct, covered, pids = machinePressure(name)
+        if pct and covered and pct >= (cfg.machineAlertPct or 90) then out[name] = { pct = pct, waiting = pids } end
+    end
+    return out
+end
+
+--endregion
+
 --region alerts
 
 local alerts = {}           -- key -> { text, since, lastSeen }
@@ -593,6 +642,7 @@ local function blockers(notes)
     for name, st in pairs(machineState) do
         if st.offline or st.foreign or st.stalled then out[#out + 1] = name .. " " .. busyReason(st) end
     end
+    for name in pairs(machinesAtCapacity()) do out[#out + 1] = name .. " at capacity" end
     table.sort(out)
     return out
 end
@@ -689,6 +739,33 @@ local function buildAlerts(notes)
         end
     end
 
+    -- Kit full but the finished block can't be crafted: the plant would just sit there.
+    local blockRes = cfg.blockCraft
+    local blockNote = blockRes and notes["craft " .. blockRes]
+    if blockNote and (blockNote == "no AE2 pattern" or blockNote:find("^needs ")) then
+        local def = cfg.resources[blockRes]
+        add("blockcraft", string.format("KIT FULL, but AE2 can't craft %ss: %s%s", def.label or blockRes,
+            blockNote == "no AE2 pattern" and ("no AE2 pattern for " .. def.id .. " (and the Inanite Block)")
+                or (blockNote:gsub("^needs (.+)$", function(r) return "ME has no " .. ((cfg.resources[r] or {}).label or r) end)),
+            ". Plant held until it can."))
+    end
+
+    -- Batch machines at capacity: ready work keeps waiting for them, so they limit throughput.
+    local window = math.floor((cfg.machineAlertSeconds or 300) / 60 + 0.5)
+    local atCapacity = machinesAtCapacity()
+    local capNames = {}
+    for name in pairs(atCapacity) do capNames[#capNames + 1] = name end
+    table.sort(capNames)
+    for _, name in ipairs(capNames) do
+        local mc = atCapacity[name]
+        local top = {}
+        for i = 1, math.min(3, #mc.waiting) do top[i] = mc.waiting[i] end
+        add("atcapacity:" .. name, string.format(
+            "%s AT CAPACITY: work waited for it %d%% of the last %d min (%s). It's limiting throughput; another %s would raise it.",
+            string.upper(name), mc.pct, window, table.concat(top, ", "), name))
+        found[#found].severity = "advisory" -- a limit, not a fault
+    end
+
     -- Batch machines that can't run.
     for name, st in pairs(machineState) do
         if st.offline or st.foreign or st.stalled then
@@ -715,7 +792,7 @@ local function updateAlerts(found)
         else
             cur.text, cur.lastSeen = a.text, t
         end
-        if scada then pcall(AlarmManager.raise, "insanite:" .. a.key, "warning", a.text, "insanite", false) end
+        if scada then pcall(AlarmManager.raise, "insanite:" .. a.key, a.severity or "warning", a.text, "insanite", false) end
     end
     for i = #alertOrder, 1, -1 do
         local key = alertOrder[i]
@@ -769,13 +846,7 @@ local function buildStatus()
     lines[#lines + 1] = { text = buttons[1].text .. "  " .. buttons[2].text, color = colors.white,
         buttons = buttons }
 
-    -- Alert banner: a full-width red band at the very top.
-    if #alertOrder > 0 then
-        add("", colors.white, colors.red)
-        add(string.format("  !!! %d ALERT%s !!!", #alertOrder, #alertOrder == 1 and "" or "S"), colors.yellow, colors.red)
-        for _, key in ipairs(alertOrder) do add("  " .. alerts[key].text, colors.white, colors.red, true) end
-        add("", colors.white, colors.red)
-    end
+    -- (Alerts aren't part of the text: they're a window drawn over the bottom-right corner.)
 
     local kit = InsanitePlanner.kitCoverage(model, lastStock)
     add(string.format("Insanite factory  cycle %d   kit %.1f/%g blk   craftable now %d",
@@ -855,8 +926,11 @@ local function buildStatus()
     add("Machines", colors.lightGray)
     for name in pairs(cfg.machines or {}) do
         local st = machineState[name] or {}
-        add(string.format("%-12s %s%s", name, busyReason(st) or "idle", stopped.machines and " (loading stopped)" or ""),
-            st.stalled and colors.red or (stopped.machines and colors.orange or colors.white))
+        local pct, covered = machinePressure(name)
+        local atCap = covered and pct and pct >= (cfg.machineAlertPct or 90)
+        add(string.format("%-12s %s%s%s", name, busyReason(st) or "idle", stopped.machines and " (loading stopped)" or "",
+            pct and string.format("   queue %d%%%s", pct, covered and "" or " (warming up)") or ""),
+            st.stalled and colors.red or ((stopped.machines or atCap) and colors.orange or colors.white))
     end
     for _, p in ipairs(model.processes) do
         if p.machine ~= "reactor" then
@@ -868,6 +942,14 @@ local function buildStatus()
 
     -- One row per reactor; reactors that make the same waste form a pool (e.g. R6+R8 -> cyanite)
     -- and share its trim and deviation.
+    if cfg.blockCraft and cfg.resources[cfg.blockCraft] then
+        local note = lastNotes["craft " .. cfg.blockCraft] or ""
+        local color = note:find("^request") and colors.lime
+            or ((note == "no AE2 pattern" or note:find("^needs")) and colors.red or colors.white)
+        add(string.format("  %-11s %s%s", "craft block", note,
+            blocksInMe and string.format("  (%d in ME)", blocksInMe) or ""), color)
+    end
+
     add("Reactor makes      trim  fuel rods  burn/target mB/t   dev  note", colors.lightGray)
     for _, p in ipairs(model.processes) do
         if p.machine == "reactor" then
@@ -956,11 +1038,40 @@ local function wrapText(text, width, indent)
 end
 Factory.wrapText = wrapText
 
+-- The alert window: drawn over the bottom-right corner of the monitor while there are alerts.
+-- Half the monitor wide (at least 30 columns), as tall as its text, never over the button row;
+-- if it doesn't fit, the last row says how much more there is. Returns nil without alerts.
+local function alertWindow(width, height)
+    if #alertOrder == 0 or width < 4 or height < 3 then return nil end
+    local w = math.max(math.min(30, width), math.floor(width / 2))
+    local inner = w - 2
+    local rows = { { text = string.format("!!! %d ALERT%s !!!", #alertOrder, #alertOrder == 1 and "" or "S"),
+        color = colors.black, bg = colors.yellow } }
+    for _, key in ipairs(alertOrder) do
+        for _, chunk in ipairs(wrapText("- " .. alerts[key].text, inner, "  ")) do
+            rows[#rows + 1] = { text = chunk:sub(1, inner), color = colors.white, bg = colors.red }
+        end
+    end
+    rows[#rows + 1] = { text = "", color = colors.white, bg = colors.red }
+    local maxRows = height - 1 -- the top row (stop buttons) always stays visible
+    if #rows > maxRows then
+        local hidden = #rows - maxRows + 1
+        for i = #rows, maxRows, -1 do rows[i] = nil end
+        rows[maxRows] = { text = string.format("... %d more line%s (/insanite/status.txt)", hidden,
+            hidden == 1 and "" or "s"):sub(1, inner), color = colors.yellow, bg = colors.red }
+    end
+    return { x = width - w + 1, y = height - #rows + 1, w = w, rows = rows }
+end
+
 local function render()
     local lines = buildStatus()
 
     if cfg.statusFile then
         local text = {}
+        if #alertOrder > 0 then
+            text[#text + 1] = string.format("!! %d ALERT%s", #alertOrder, #alertOrder == 1 and "" or "S")
+            for _, key in ipairs(alertOrder) do text[#text + 1] = "!! " .. alerts[key].text end
+        end
         for _, l in ipairs(lines) do text[#text + 1] = (l.bg and "!! " or "") .. l.text end
         local dir = fs.getDir(cfg.statusFile)
         if dir ~= "" and not fs.exists(dir) then fs.makeDir(dir) end
@@ -978,7 +1089,7 @@ local function render()
                 mon.setTextScale(0.5)
                 mon.setBackgroundColor(colors.black)
                 mon.clear()
-                local width = mon.getSize()
+                local width, height = mon.getSize()
                 local y = 1
                 for _, l in ipairs(lines) do
                     local chunks = l.wrap and wrapText(l.text, width - 1, "      ") or { l.text }
@@ -1004,9 +1115,19 @@ local function render()
                         mon.setCursorPos(1, y)
                         mon.setBackgroundColor(l.bg or colors.black)
                         mon.setTextColor(l.color)
-                        -- banner lines are padded so the red band spans the whole monitor
+                        -- lines with a background are padded so the colour spans the whole monitor
                         mon.write(l.bg and (chunk .. string.rep(" ", math.max(0, width - #chunk))) or chunk)
                         y = y + 1
+                    end
+                end
+                -- Alert window on top of everything, bottom-right.
+                local win = alertWindow(width, height)
+                if win then
+                    for i, r in ipairs(win.rows) do
+                        mon.setCursorPos(win.x, win.y + i - 1)
+                        mon.setBackgroundColor(r.bg)
+                        mon.setTextColor(r.color)
+                        mon.write(" " .. r.text .. string.rep(" ", win.w - 1 - #r.text))
                     end
                 end
                 mon.setBackgroundColor(colors.black)
@@ -1042,7 +1163,9 @@ function Factory.init(extraOverrides)
 
     machineState, reactorInfo, lastEject, craftableCache, stockState = {}, {}, {}, {}, {}
     lastNotes, lastActions, lastStock, lastProjected = {}, {}, {}, {}
+    blocksInMe = nil
     alerts, alertOrder, trackSince, deviation, slowSince = {}, {}, {}, { reactors = {} }, nil
+    machineLoad = {}
     local saved = readTableFile(cfg.stateFile)
     for name, process in pairs(saved or {}) do
         machineState[name] = { process = process }
@@ -1160,10 +1283,11 @@ function Factory.cycle()
             end
         end
     end
-    local actions, notes, projected = InsanitePlanner.plan(cfg, model, need, {
+    local actions, notes, projected, waiting = InsanitePlanner.plan(cfg, model, need, {
         stock = stock, pending = pending, busy = busy, running = running, crafting = crafting, craftable = craftable,
         craftsStopped = stopped.machines,
     })
+    if stopped.machines then machineLoad = {} else sampleMachines(waiting) end
 
     -- 5. Act.
     for _, a in ipairs(actions) do
@@ -1174,6 +1298,26 @@ function Factory.cycle()
             local loaded, short = runBatch(p, a.ops)
             if loaded == 0 then notes[p.id] = "needs " .. tostring(short) .. " (gone before loading)" end
         end
+    end
+
+    -- 5b. The finished block: once the kit is at target, AE2 crafts Insanite Blocks from it.
+    local blockRes = cfg.blockCraft
+    if blockRes and cfg.resources[blockRes] then
+        local enabled = InsanitePlanner.ALLOWED_CRAFTS[blockRes] and (cfg.autocraft or {})[blockRes] == true
+        local crafting, craftable = false, nil
+        if enabled and not stopped.machines
+            and InsanitePlanner.kitCoverage(model, stock) >= (cfg.stockBlocks or 2) then
+            crafting = isCrafting(blockRes)
+            craftable = isCraftable(blockRes)
+        end
+        local n, note = InsanitePlanner.blockCraft(cfg, model, stock,
+            { stopped = stopped.machines, crafting = crafting, craftable = craftable })
+        if n > 0 then
+            requestCraft({ output = blockRes, outQty = 1 }, n)
+            event("kit full: %d %s requested from AE2", n, cfg.resources[blockRes].label or blockRes)
+        end
+        notes["craft " .. blockRes] = note
+        blocksInMe = meAmount(cfg.resources[blockRes])
     end
 
     -- 6. Ratio deviations (actual burn vs the reference reactor) and alerts.

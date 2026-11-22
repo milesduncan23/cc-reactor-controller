@@ -28,6 +28,12 @@ _G.INSANITE_DEFAULTS = {
     -- whether you have enough of it.
     kit = { insanite = 8, inanite = 8, netherite_block = 1 },
 
+    -- The finished block. Once ME holds the full kit target (stockBlocks' worth of insanite and
+    -- inanite) and autocraft.insanite_block is on, the plugin asks AE2 for as many Insanite Blocks
+    -- as ME has every kit item for (netherite included). AE2 needs patterns for the Insanite Block
+    -- and the Inanite Block. The kit then empties and the plant refills it.
+    blockCraft = "insanite_block",
+
     -- Reserve target: ME should hold this many Insanite Blocks' worth of every material in the
     -- chain, each in recipe ratio. The whole plant slows as the kit fills and stops when full.
     stockBlocks = 2,
@@ -62,7 +68,8 @@ _G.INSANITE_DEFAULTS = {
 
     ejectWasteAbovePct = 0,   -- >0: call doEjectWaste() when a reactor's waste exceeds this % (0 = off)
 
-    -- AE2 autocraft requests: the ONLY two things the plugin may ever ask AE2 to craft (also
+    -- AE2 autocraft requests that keep ME stocked (the block itself is blockCraft, above). With
+    -- the Insanite Block these are the ONLY things the plugin may ever ask AE2 to craft (also
     -- enforced in code). Each must be switched on in /insanite.conf (autocraft = { ... }) and
     -- needs a matching pattern in AE2. A request is made when ME holds less than stockBlocks'
     -- worth and AE2 isn't already crafting it. `inputs`/`outQty` describe one craft so the
@@ -74,17 +81,22 @@ _G.INSANITE_DEFAULTS = {
     maxCraftItems = 64,       -- most ingots per AE2 request
     maxCraftFluid = 16000,    -- most mB per AE2 request
 
-    -- Alerts (red banner on the status monitor, and in the core's alarm list when scadaAlarms):
+    -- Alerts (a window over the bottom-right of the status monitor, and in the core's alarm list
+    -- when scadaAlarms):
     --   * plant slowed: by a waste piling up (overflow) or by a reactor at its max burn
     --   * a reactor off its own burn target by more than deviationAlertPct for
     --     deviationAlertSeconds (out of fuel, stuck rods, ...)
     --   * a batch machine stalled, holding unknown items, or with a missing port
+    --   * a batch machine at capacity: ready work waited for it in machineAlertPct of the cycles
+    --     over the last machineAlertSeconds (it is limiting throughput; advisory in SCADA)
     -- The reactor table shows each reactor's % deviation from the plant config's referenceReactor.
     deviationAlertPct = 15,
     deviationAlertSeconds = 120,
     slowAlertPct = 25,        -- alert when the plant runs this much slower than the reserve asks
                               -- (a healthy plant dips at most ~20% from normal buffer swings)
     slowAlertSeconds = 600,   -- overflow slowdowns with no identified cause must last this long
+    machineAlertPct = 90,     -- a machine is "at capacity" when work waited for it this % of the time
+    machineAlertSeconds = 300,-- ... over this window
     alertClearSeconds = 30,   -- an alert clears once its cause has been gone this long
     scadaAlarms = true,
 
@@ -104,6 +116,7 @@ _G.INSANITE_DEFAULTS = {
         ridiculite      = { kind = "item",  id = "bigreactors:ridiculite_ingot",  label = "Ridiculite" },
         inanite         = { kind = "item",  id = "bigreactors:inanite_ingot",     label = "Inanite" },
         insanite        = { kind = "item",  id = "bigreactors:insanite_ingot",    label = "Insanite" },
+        insanite_block  = { kind = "item",  id = "bigreactors:insanite_block",    label = "Insanite Blk" },
         benitoite       = { kind = "item",  id = "bigreactors:benitoite_crystal", label = "Benitoite" },
         netherite_block = { kind = "item",  id = "minecraft:netherite_block",     label = "Netherite Blk" },
         water           = { kind = "fluid", id = "minecraft:water",               label = "Water" },
@@ -171,9 +184,10 @@ _G.INSANITE_DEFAULTS = {
           inputs = { { res = "ludicrite", qty = 2, port = "solid" }, { res = "magentite_fluid", qty = 1000, port = "fluid" } } },
         { id = "ludicrite", machine = "reprocessor", output = "ludicrite", outQty = 1,
           inputs = { { res = "blutonium", qty = 2, port = "solid" }, { res = "cyanite_fluid", qty = 1000, port = "fluid" } } },
-        -- priority: planned before every other recipe, and while it's below target (reprocessor
-        -- free or already on blutonium) it holds its cyanite, so the liquid-cyanite craft can't
-        -- take single ingots it is waiting to pair up.
+        -- priority: when it's the reprocessor's pick (furthest behind) or already running, it holds
+        -- its cyanite, so the liquid-cyanite craft can't take single ingots it is waiting to pair
+        -- up. It doesn't jump the reprocessor's queue: that starved every other recipe once
+        -- cyanite was plentiful (MA crops).
         { id = "blutonium", machine = "reprocessor", output = "blutonium", outQty = 1, priority = true,
           inputs = { { res = "cyanite", qty = 2, port = "solid" }, { res = "water", qty = 1000, port = "fluid" } } },
         { id = "verderium", machine = "fluidizer", output = "verderium", outQty = 2000,

@@ -32,8 +32,9 @@ local Planner = {}
 local HUGE = math.huge
 
 -- The only things the plugin may ever ask AE2 to craft. Anything else is refused here and in
--- the factory, whatever the config says.
-Planner.ALLOWED_CRAFTS = { cyanite_fluid = true, magentite_fluid = true }
+-- the factory, whatever the config says. insanite_block is the finished block (cfg.blockCraft);
+-- the other two keep ME stocked.
+Planner.ALLOWED_CRAFTS = { cyanite_fluid = true, magentite_fluid = true, insanite_block = true }
 
 local function clamp(value, lo, hi)
     if value < lo then return lo end
@@ -114,7 +115,7 @@ function Planner.buildModel(cfg)
     -- AE2 crafts: only allowed ones, only when enabled in the plant config.
     for _, res in ipairs(sortedKeys(cfg.crafts)) do
         local c = cfg.crafts[res]
-        if Planner.ALLOWED_CRAFTS[res] and (cfg.autocraft or {})[res] == true then
+        if Planner.ALLOWED_CRAFTS[res] and (cfg.autocraft or {})[res] == true and res ~= cfg.blockCraft then
             order = order + 1
             local inputs = {}
             for _, inp in ipairs(c.inputs or {}) do inputs[#inputs + 1] = { res = inp.res, qty = inp.qty } end
@@ -236,6 +237,32 @@ function Planner.craftableBlocks(model, stock)
     return n == HUGE and 0 or math.floor(n)
 end
 
+-- The finished-block craft (cfg.blockCraft): once ME holds the full kit target, ask AE2 for as
+-- many blocks as ME has every kit item for. Returns the count to request (0 = none) and a note.
+-- snap = { stopped = machines stop button on, crafting = AE2 job running, craftable = false when
+-- AE2 has no pattern }.
+function Planner.blockCraft(cfg, model, stock, snap)
+    local res = cfg.blockCraft
+    if not res or not Planner.ALLOWED_CRAFTS[res] then return 0, nil end
+    if (cfg.autocraft or {})[res] ~= true then return 0, "off (autocraft." .. res .. ")" end
+    if snap.stopped then return 0, "crafts stopped" end
+    if snap.crafting then return 0, "AE2 crafting" end
+    local K = cfg.stockBlocks or 2
+    local kit = Planner.kitCoverage(model, stock)
+    if kit < K then return 0, string.format("waiting: kit %.1f/%g blk", kit, K) end
+    if snap.craftable == false then return 0, "no AE2 pattern" end
+    local n = Planner.craftableBlocks(model, stock)
+    if n < 1 then
+        local short
+        for _, item in ipairs(sortedKeys(model.kit)) do
+            if (stock[item] or 0) < model.kit[item] then short = item end
+        end
+        return 0, "needs " .. tostring(short)
+    end
+    n = math.min(n, cfg.maxCraftItems or 64)
+    return n, "request " .. n
+end
+
 -- Operations of p still wanted before its output reaches stockBlocks coverage.
 local function opsWanted(cfg, need, projected, p)
     if (need[p.output] or 0) <= 0 then return 0 end
@@ -264,13 +291,17 @@ end
 --   craftsStopped = true while the machines stop button is on (no AE2 requests),
 --   craftable = { [res] = false when AE2 has no pattern for it },
 -- }
--- Returns actions (list of { process, ops }), notes ({ [processId] = state text }), projected.
+-- Returns actions (list of { process, ops }), notes ({ [processId] = state text }), projected, and
+-- waiting ({ [machineName] = { processId, ... } }): recipes that were ready (below target, every
+-- input in ME for at least one operation) but didn't get the machine this cycle because it was
+-- running, taken by another recipe, or full. Work that keeps waiting means the machine is
+-- limiting throughput (see the factory's at-capacity alert).
 --
--- A job is only planned for whole operations ME holds EVERY input for. Priority recipes
--- (priority = true in the recipe, e.g. blutonium) go before everything else, and while one is
--- below target and its machine is free or already running it, it holds its inputs (up to one
--- full load) even when there isn't enough yet for one operation: lower-priority recipes and AE2
--- crafts only get what's left over.
+-- A job is only planned for whole operations ME holds EVERY input for. Each machine runs the
+-- recipe whose product is furthest behind. Machine recipes claim shared inputs before AE2 crafts,
+-- and a priority recipe (priority = true, e.g. blutonium) that is its machine's pick, or already
+-- running, also holds its inputs (up to one full load) even when there isn't enough yet for one
+-- operation, so AE2 crafts only get what's left over. Priority never jumps the machine's queue.
 function Planner.plan(cfg, model, need, snap)
     local avail, projected = {}, {}
     for res in pairs(model.resources) do
@@ -279,6 +310,19 @@ function Planner.plan(cfg, model, need, snap)
     end
 
     local candidates, notes, holds = {}, {}, {}
+    local waiting, waitingSeen = {}, {}
+    local function addWaiting(machine, pid)
+        if waitingSeen[machine .. "\0" .. pid] then return end
+        waitingSeen[machine .. "\0" .. pid] = true
+        waiting[machine] = waiting[machine] or {}
+        table.insert(waiting[machine], pid)
+    end
+    local function readyIn(have, p)
+        for _, inp in ipairs(p.inputs) do
+            if (have[inp.res] or 0) < inp.qty then return false end
+        end
+        return true
+    end
 
     for _, p in ipairs(model.processes) do
         if p.machine ~= "reactor" then
@@ -307,6 +351,11 @@ function Planner.plan(cfg, model, need, snap)
                     notes[p.id] = "machine not configured"
                 elseif (snap.busy or {})[p.machine] then
                     notes[p.id] = p.machine .. " " .. snap.busy[p.machine]
+                    -- Ready work that has to wait for a machine that is busy working (not one
+                    -- that's stalled, broken or stopped by the button).
+                    if tostring(snap.busy[p.machine]):find("^running") and cand.wanted > 0 and readyIn(avail, p) then
+                        addWaiting(p.machine, p.id)
+                    end
                     -- Already running a priority recipe: it keeps first claim on its inputs.
                     if p.priority and (snap.running or {})[p.machine] == p.id and cand.wanted > 0 then
                         holds[#holds + 1] = { p = p, ops = math.min(cand.wanted, Planner.machineCapacityOps(cfg, m, p)) }
@@ -327,7 +376,8 @@ function Planner.plan(cfg, model, need, snap)
     end
 
     table.sort(candidates, function(a, b)
-        if (a.p.priority and true or false) ~= (b.p.priority and true or false) then return a.p.priority == true end
+        local am, bm = a.p.machine ~= "ae2", b.p.machine ~= "ae2"
+        if am ~= bm then return am end -- machine recipes claim shared inputs before AE2 crafts
         if a.cov ~= b.cov then return a.cov < b.cov end
         return a.p.order < b.p.order
     end)
@@ -351,6 +401,7 @@ function Planner.plan(cfg, model, need, snap)
         local exclusive = p.machine ~= "ae2"
         if exclusive and taken[p.machine] then
             notes[p.id] = "waiting (" .. p.machine .. " -> " .. taken[p.machine] .. ")"
+            if readyIn(avail, p) then addWaiting(p.machine, p.id) end
         else
             local full = math.min(c.wanted, c.cap)
             local short, shortOps = nil, HUGE
@@ -363,7 +414,11 @@ function Planner.plan(cfg, model, need, snap)
                 for _, inp in ipairs(p.inputs) do
                     avail[inp.res] = avail[inp.res] - ops * inp.qty
                 end
-                if exclusive then taken[p.machine] = p.id end
+                if exclusive then
+                    taken[p.machine] = p.id
+                    -- Loaded to the machine's limit with more wanted and ME holding more: full.
+                    if ops == c.cap and c.wanted > c.cap and shortOps > c.cap then addWaiting(p.machine, p.id) end
+                end
                 actions[#actions + 1] = { process = p, ops = ops }
                 if p.machine == "ae2" then
                     local def = model.resources[p.output]
@@ -382,7 +437,7 @@ function Planner.plan(cfg, model, need, snap)
         end
     end
 
-    return actions, notes, projected
+    return actions, notes, projected, waiting
 end
 
 -- Max plant pace in Insanite Blocks per game tick: the slowest machine with a known speed
@@ -1174,10 +1229,13 @@ function Planner.validatePlant(plant, defaults, network)
         end
     end
 
-    -- AE2 autocraft: exactly which of the three allowed crafts are on. Must be stated explicitly.
+    -- AE2 autocraft: exactly which of the allowed crafts are on. Must be stated explicitly.
     local craftNames = keysOf(Planner.ALLOWED_CRAFTS)
     local crafts = defaults.crafts or {}
     local function craftLine(res)
+        if res == defaults.blockCraft then
+            return ((resources[res] or {}).label or res) .. "s once ME holds the full kit target"
+        end
         local c = crafts[res] or {}
         local made = (resources[res] or {}).label or res
         if #(c.inputs or {}) == 0 then return made .. " (ingredients are up to your AE2 pattern)" end
@@ -1185,13 +1243,17 @@ function Planner.validatePlant(plant, defaults, network)
         for _, inp in ipairs(c.inputs) do from[#from + 1] = inp.qty .. " " .. ((resources[inp.res] or {}).label or inp.res) end
         return made .. " from " .. table.concat(from, " + ")
     end
+    local function patternNeed(res)
+        if res == defaults.blockCraft then return "needs AE2 patterns for the Insanite Block and the Inanite Block" end
+        return "needs an AE2 pattern"
+    end
     local craftOn = {}
     if plant.autocraft == nil or plant.autocraft == false then
         local lines = { "autocraft is missing: which of the " .. #craftNames
             .. " allowed AE2 crafts the plugin may request (true) or never request (false).",
             "Add to the top-level table:", "autocraft = {" }
         for _, res in ipairs(craftNames) do
-            lines[#lines + 1] = "  " .. res .. " = true,   -- " .. craftLine(res) .. "; needs an AE2 pattern"
+            lines[#lines + 1] = "  " .. res .. " = true,   -- " .. craftLine(res) .. "; " .. patternNeed(res)
         end
         lines[#lines + 1] = "},"
         err(table.unpack(lines))
@@ -1209,7 +1271,7 @@ function Planner.validatePlant(plant, defaults, network)
             local v = plant.autocraft[res]
             if v == nil then
                 err("autocraft." .. res .. " is missing: true lets the plugin ask AE2 for " .. craftLine(res)
-                    .. " (needs an AE2 pattern); false = never.",
+                    .. " (" .. patternNeed(res) .. "); false = never.",
                     "Add inside autocraft:   " .. res .. " = true,")
             elseif type(v) ~= "boolean" then
                 err("autocraft." .. res .. " must be true or false, but it is " .. describe(v) .. ".")

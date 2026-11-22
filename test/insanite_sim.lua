@@ -39,6 +39,8 @@ local function writePlant(text)
 end
 local function id(res) return D.resources[res].id end
 -- Variant with R6 + R8 in the locked ratio instead of the stock pool (for the lock's own tests).
+-- The same plant with the Insanite Block autocraft off (the kit then just sits full).
+local PLANT_NO_BLOCK = (PLANT_TEXT:gsub("insanite_block = true,", "insanite_block = false,", 1))
 local PLANT_TEXT_RATIO = PLANT_TEXT:gsub('waste = "cyanite", rodControl = "stock"', 'waste = "cyanite", rodControl = "ratio"')
 local D_RATIO = InsaniteFactory.deepMerge(InsaniteFactory.deepMerge(INSANITE_DEFAULTS, {}),
     assert(load("return " .. PLANT_TEXT_RATIO, "=ratio", "t", {}))())
@@ -124,7 +126,7 @@ end
 
 --region fake world
 
-local ALLOWED = { [id("cyanite_fluid")] = "fluid", [id("magentite_fluid")] = "fluid" }
+local ALLOWED = { [id("cyanite_fluid")] = "fluid", [id("magentite_fluid")] = "fluid", [id("insanite_block")] = "item" }
 
 local function newWorld(opts)
     opts = opts or {}
@@ -133,7 +135,8 @@ local function newWorld(opts)
     fs.delete(D.pauseFile)
 
     local W = { me = { item = {}, fluid = {} },
-        stats = { mixed = 0, stuck = 0, badCrafts = 0, badFilters = 0, crafted = 0, craftRequests = {}, craftDuplicates = 0 } }
+        stats = { mixed = 0, stuck = 0, badCrafts = 0, badFilters = 0, crafted = 0, craftRequests = {}, craftDuplicates = 0,
+            blockRequests = {} } }
     local me = W.me
     local function add(kind, gid, n) me[kind][gid] = (me[kind][gid] or 0) + n end
 
@@ -188,6 +191,7 @@ local function newWorld(opts)
     -- Fluidizer (solid mixing, ATM10 recipe): 2 uranium + 1 blutonium -> 2000 mB verderium
     local fuelOk = { [id("uranium")] = true, [id("blutonium")] = true }
     local fa, fb = slot(64, fuelOk), slot(64, fuelOk)
+    local fluidizerTimer = 0
     inventoryPort(D.machines.fluidizer.ports.a, fa, "bigreactors:fluidizersolidinjector")
     inventoryPort(D.machines.fluidizer.ports.b, fb, "bigreactors:fluidizersolidinjector")
 
@@ -234,6 +238,17 @@ local function newWorld(opts)
         end
         if (opts.noPatterns or {})[gid] then return nil, "NOT_CRAFTABLE" end
         if pending(gid) then W.stats.craftDuplicates = W.stats.craftDuplicates + 1 end
+        if gid == id("insanite_block") then
+            -- AE2's two patterns: Inanite Block = 8 inanite + netherite block; Insanite Block =
+            -- 8 insanite + Inanite Block. Ingredients leave ME when the job starts.
+            local i, a, n = id("insanite"), id("inanite"), id("netherite_block")
+            table.insert(W.stats.blockRequests, { count = amount, insanite = me.item[i] or 0, inanite = me.item[a] or 0,
+                netherite = me.item[n] or 0 })
+            if (me.item[i] or 0) < 8 * amount or (me.item[a] or 0) < 8 * amount or (me.item[n] or 0) < amount then
+                return nil, "MISSING_ITEMS"
+            end
+            add("item", i, -8 * amount); add("item", a, -8 * amount); add("item", n, -amount)
+        end
         if gid == id("cyanite_fluid") or gid == id("magentite_fluid") then
             local ingot = (gid == id("cyanite_fluid")) and id("cyanite") or id("magentite")
             local need = math.ceil(amount / 1000)
@@ -313,8 +328,12 @@ local function newWorld(opts)
         local y = (fa.id == id("uranium") and fa) or (fb.id == id("uranium") and fb)
         local b = (fa.id == id("blutonium") and fa) or (fb.id == id("blutonium") and fb)
         if y and b and y.n >= 2 and b.n >= 1 then
-            take(y, 2); take(b, 1)
-            add("fluid", id("verderium"), 2000)
+            fluidizerTimer = fluidizerTimer + 1 -- one operation per opts.fluidizerSeconds (default 1 s)
+            if fluidizerTimer >= (opts.fluidizerSeconds or 1) then
+                fluidizerTimer = 0
+                take(y, 2); take(b, 1)
+                add("fluid", id("verderium"), 2000)
+            end
         end
 
         -- AE2 jobs finishing
@@ -625,18 +644,24 @@ end
 
 --region 5. full plant
 
-print("full plant: ME importer refuels, player crafts a block every 400 s for 6 h, then stops for 3 h")
+print("full plant (block autocraft off): ME importer refuels, player crafts a block every 400 s for 6 h, then stops for 3 h")
 do
     _G.__simClock = 0
     local W = newWorld()
     stockUp(W)
     local raised = {}
-    runWorld(W, 6 * 3600, {}, { craftEvery = 400, onCycle = function()
+    runWorld(W, 6 * 3600, {}, { craftEvery = 400, plantText = PLANT_NO_BLOCK, onCycle = function()
         for _, a in ipairs(InsaniteFactory.alerts()) do raised[a.key] = a.text end
     end })
     local need = InsaniteFactory.needs()
     local crafted = W.stats.crafted
-    check(next(raised) == nil, "healthy plant raised no alerts (" .. tostring(next(raised) and raised[next(raised)]) .. ")")
+    -- This simulated plant is reprocessor-limited by design (the player asks ~9 blocks/h, one
+    -- reprocessor makes ~8.7), so the advisory at-capacity notice is right; nothing else may fire.
+    local faults = {}
+    for key, text in pairs(raised) do if key ~= "atcapacity:reprocessor" then faults[#faults + 1] = text end end
+    check(#faults == 0, "healthy plant raised no fault alerts (" .. table.concat(faults, " | ") .. ")")
+    check(raised["atcapacity:reprocessor"] ~= nil, "and named the reprocessor as its bottleneck: "
+        .. tostring(raised["atcapacity:reprocessor"]))
     check(W.stats.badCrafts == 0 and W.stats.badFilters == 0, "AE2 only ever asked for the three allowed crafts, with typed filters")
     check((W.peaks.cyanite or 0) >= D.stockCaps.cyanite and (W.peaks.cyanite or 0) <= D.stockCaps.cyanite + 64,
         string.format("cyanite filled to its cap and no further (peak %d, cap %d)", W.peaks.cyanite or 0, D.stockCaps.cyanite))
@@ -754,7 +779,7 @@ end
 
 --region 7. kit full from the start
 
-print("kit already full: reactors held, nothing crafted")
+print("kit already full, block autocraft off: reactors held, nothing crafted")
 do
     _G.__simClock = 0
     local W = newWorld()
@@ -767,7 +792,7 @@ do
             W.me[def.kind][def.id] = D.stockBlocks * n
         end
     end
-    runWorld(W, 120)
+    runWorld(W, 120, nil, { plantText = PLANT_NO_BLOCK })
     check(W.reactors[R5].burnedTotal == 0 and W.reactors[R7].burnedTotal == 0,
         "locked reactors R5 and R7 don't burn while the kit is at target")
     check(W.reactors[R6].burnedTotal > 0, "stock reactors R6 + R8 keep filling cyanite toward its cap")
@@ -777,9 +802,106 @@ end
 
 --endregion
 
+--region 7b. Insanite Block autocraft
+
+print("Insanite Block autocraft: once the kit is at target, AE2 crafts the blocks and the plant refills")
+do
+    local model = InsanitePlanner.buildModel(D)
+    local function bc(stock, snap, cfg)
+        local n, note = InsanitePlanner.blockCraft(cfg or D, model, stock, snap or {})
+        return n, tostring(note)
+    end
+    local full = { insanite = 16, inanite = 16, netherite_block = 5 }
+    local n, note = bc({ insanite = 16, inanite = 12, netherite_block = 5 })
+    check(n == 0 and note == "waiting: kit 1.5/2 blk", "kit short -> nothing (" .. note .. ")")
+    n, note = bc(full)
+    check(n == 2 and note == "request 2", "kit at target -> both blocks requested (" .. note .. ")")
+    n = bc({ insanite = 16, inanite = 16, netherite_block = 1 })
+    check(n == 1, "one netherite block -> only one block")
+    n, note = bc({ insanite = 16, inanite = 16, netherite_block = 0 })
+    check(n == 0 and note == "needs netherite_block", "no netherite -> waits (" .. note .. ")")
+    n, note = bc(full, { craftable = false })
+    check(n == 0 and note == "no AE2 pattern", "no AE2 pattern -> nothing (" .. note .. ")")
+    n, note = bc(full, { crafting = true })
+    check(n == 0 and note == "AE2 crafting", "already crafting -> not requested again")
+    n, note = bc(full, { stopped = true })
+    check(n == 0 and note == "crafts stopped", "machines button on -> nothing")
+    local off = copy(D)
+    off.autocraft.insanite_block = false
+    n, note = bc(full, nil, off)
+    check(n == 0 and note:find("^off"), "autocraft.insanite_block = false -> never (" .. note .. ")")
+    check(model.byId["craft insanite_block"] == nil, "the block craft isn't a stock-keeping craft in the model")
+
+    -- A world with the kit already at target.
+    local function fullKitWorld(netherite, opts)
+        _G.__simClock = 0
+        local W = newWorld(opts)
+        stockUp(W)
+        local need = InsanitePlanner.computeNeeds(model)
+        for res, k in pairs(need) do
+            local def = D.resources[res]
+            if res ~= "water" and res ~= "benitoite" and res ~= "netherite_block" and res ~= "uranium" then
+                W.me[def.kind][def.id] = D.stockBlocks * k
+            end
+        end
+        W.me.item[id("netherite_block")] = netherite
+        return W
+    end
+
+    local W = fullKitWorld(500)
+    runWorld(W, 30)
+    local r = W.stats.blockRequests
+    check(#r == 1 and r[1].count == 2 and r[1].insanite == 16 and r[1].inanite == 16,
+        string.format("kit full from the start -> AE2 asked for %s block(s) at once", r[1] and r[1].count or 0))
+    check(amount(W, "insanite_block") == 2 and amount(W, "netherite_block") == 498 and amount(W, "insanite") < 16,
+        "2 Insanite Blocks in ME; kit and 2 netherite blocks used (refill already started)")
+    runWorld(W, 4 * 3600, nil, { continue = true })
+    local sized = true
+    for _, q in ipairs(W.stats.blockRequests) do
+        if q.insanite < 16 or q.inanite < 16 or q.count ~= 2 then sized = false end
+    end
+    check(#W.stats.blockRequests >= 3 and sized, string.format(
+        "plant refilled the kit and AE2 crafted again: %d requests in 4 h, each with the full kit, 2 blocks each",
+        #W.stats.blockRequests))
+    check(amount(W, "insanite_block") == 2 * #W.stats.blockRequests, amount(W, "insanite_block") .. " Insanite Blocks in ME")
+    check(W.reactors[R5].burnedTotal > 0 and W.reactors[R7].burnedTotal > 0, "R5 + R7 run again to refill the kit")
+    check(W.stats.craftDuplicates == 0 and W.stats.badCrafts == 0, "never re-requested while crafting, nothing disallowed")
+
+    W = fullKitWorld(1)
+    runWorld(W, 30)
+    check(W.stats.blockRequests[1] and W.stats.blockRequests[1].count == 1, "one netherite block in ME -> one block requested")
+
+    local function alertText(key)
+        for _, a in ipairs(InsaniteFactory.alerts()) do if a.key == key then return a.text end end
+    end
+    W = fullKitWorld(0)
+    runWorld(W, 30)
+    check(#W.stats.blockRequests == 0 and InsaniteFactory.lastNotes()["craft insanite_block"] == "needs netherite_block",
+        "no netherite -> nothing requested, status says why")
+    check((alertText("blockcraft") or ""):find("ME has no Netherite Blk", 1, true),
+        "alert: " .. tostring(alertText("blockcraft")))
+
+    W = fullKitWorld(500, { noPatterns = { [id("insanite_block")] = true } })
+    runWorld(W, 30)
+    check(#W.stats.blockRequests == 0 and (alertText("blockcraft") or ""):find("no AE2 pattern for bigreactors:insanite_block", 1, true),
+        "no AE2 pattern -> alert: " .. tostring(alertText("blockcraft")))
+
+    W = fullKitWorld(500)
+    runWorld(W, 30)
+    InsaniteFactory.setStopped("machines", true)
+    local before = #W.stats.blockRequests
+    W.me.item[id("insanite")], W.me.item[id("inanite")] = 16, 16
+    runWorld(W, 60, nil, { continue = true })
+    check(#W.stats.blockRequests == before and InsaniteFactory.lastNotes()["craft insanite_block"] == "crafts stopped",
+        "machines button on -> no block craft even with the kit full")
+    InsaniteFactory.setStopped("machines", false)
+end
+
+--endregion
+
 --region 8. AE2 craft requests
 
-print("AE2 craft requests: only the two allowed, sized, not repeated, honest about missing patterns")
+print("AE2 stock-keeping crafts: only the allowed ones, sized, not repeated, honest about missing patterns")
 do
     _G.__simClock = 0
     local W = newWorld()
@@ -858,6 +980,37 @@ do
     check(held() == 2, "and both injectors hold their share")
 end
 
+print("in-game regression: plentiful cyanite (MA crops) must not lock the reprocessor on blutonium")
+do
+    -- ME as on the status screen when it happened; cyanite kept available every cycle.
+    _G.__simClock = 0
+    local W = newWorld()
+    stockUp(W)
+    local start = { insanite = 0, inanite = 0, ridiculite = 22, ludicrite = 1, blutonium = 61, verderium = 0,
+        cyanite_fluid = 64000, magentite_fluid = 67500, cyanite = 38, magentite = 76, rossinite = 34900, benitoite = 1004 }
+    for res, v in pairs(start) do W.me[D.resources[res].kind][id(res)] = v end
+    local jobs, recipeOf = {}, { cyanite = "blutonium", blutonium = "ludicrite", ludicrite = "ridiculite",
+        ridiculite = "inanite", benitoite = "insanite" }
+    local byId = {}
+    for res, r in pairs(recipeOf) do byId[id(res)] = r end
+    local bridge = peripheral._registry[D.bridge].methods
+    local real = bridge.exportItem
+    bridge.exportItem = function(t, f)
+        local n = real(t, f)
+        if t == D.machines.reprocessor.ports.solid and (tonumber(n) or 0) > 0 then jobs[#jobs + 1] = byId[f.name] end
+        return n
+    end
+    runWorld(W, 20 * 60, nil, { onCycle = function()
+        W.me.item[id("cyanite")] = math.max(W.me.item[id("cyanite")] or 0, 40)
+    end })
+    check(jobs[1] == "insanite" and jobs[2] == "inanite" and jobs[3] == "ludicrite",
+        "furthest-behind recipes go first: " .. table.concat(jobs, " ", 1, math.min(6, #jobs)))
+    local ran = {}
+    for _, r in ipairs(jobs) do ran[r] = true end
+    check(ran.insanite and ran.inanite and ran.ridiculite and ran.ludicrite and ran.blutonium,
+        "all five reprocessor recipes ran within 20 min")
+end
+
 print("blutonium recipe first: holds its cyanite from the liquid-cyanite craft")
 do
     local model = InsanitePlanner.buildModel(D)
@@ -900,9 +1053,11 @@ do
     by = planned(snap(1, { stock = { blutonium = D.stockBlocks * need.blutonium } }))
     check(by["craft cyanite_fluid"] == 1, "blutonium at target: the craft may use it")
 
-    -- Ludicrite is further behind than blutonium here, but blutonium still goes in first.
+    -- Ludicrite is further behind than blutonium: it gets the reprocessor (priority doesn't jump
+    -- the queue), and blutonium, not being the pick, holds nothing.
     by = planned(snap(2, { stock = { blutonium = 100, cyanite_fluid = 64000 } }))
-    check(by.blutonium == 1 and by.ludicrite == nil, "reprocessor free: blutonium before a further-behind recipe")
+    check(by.ludicrite and by.ludicrite >= 1 and by.blutonium == nil,
+        "reprocessor free: the further-behind recipe (ludicrite) goes first, not blutonium")
     by = planned(snap(1, { stock = { blutonium = 100, cyanite_fluid = 64000 } }))
     check(by.ludicrite and by.ludicrite >= 1, "blutonium short of a load: the reprocessor runs ludicrite meanwhile")
 end
@@ -1126,8 +1281,9 @@ do
     check(text ~= nil and text:find("insanite needs benitoite", 1, true) ~= nil, "alert: " .. tostring(text))
     check(scada["insanite:overflow"] ~= nil, "same alert raised in the core alarm list (SCADA)")
     local lines = InsaniteFactory.statusLines()
-    check(lines[1].buttons and lines[2].bg == colors.red and lines[3].text:find("ALERT") ~= nil,
-        "red alert banner at the top of the screen, right under the stop buttons")
+    local banner = false
+    for _, l in ipairs(lines) do if l.bg == colors.red or l.text:find("ALERT", 1, true) then banner = true end end
+    check(lines[1].buttons and not banner, "no banner in the screen text (alerts are a window, tested below)")
 
     W.me.item[id("benitoite")] = 10000
     runWorld(W, 3 * 3600, nil, { continue = true })
@@ -1177,6 +1333,173 @@ do
 end
 
 _G.AlarmManager = nil
+
+--endregion
+
+--region 9b. alert window
+
+print("alert window: over the bottom-right corner while there's an alert, gone after")
+do
+    local function kitFullNoNetherite(mon)
+        _G.__simClock = 0
+        local W = newWorld()
+        stockUp(W)
+        local model = InsanitePlanner.buildModel(D)
+        for res, k in pairs(InsanitePlanner.computeNeeds(model)) do
+            local def = D.resources[res]
+            if res ~= "water" and res ~= "benitoite" and res ~= "netherite_block" and res ~= "uranium" then
+                W.me[def.kind][def.id] = D.stockBlocks * k
+            end
+        end
+        W.me.item[id("netherite_block")] = 0 -- kit full, but no netherite: an alert right away
+        peripheral.register(D.monitor, "monitor", mon)
+        return W
+    end
+    local function cell(mon, x, y) return mon._grid[y][x] or {} end
+    local function text(mon, y, x1, x2)
+        local out = {}
+        for x = x1 or 1, x2 or mon._w do out[#out + 1] = cell(mon, x, y).ch or " " end
+        return (table.concat(out):gsub("%s+$", ""))
+    end
+
+    local mon = makeTerm(79, 45) -- a 4x4 Advanced Monitor at text scale 0.5
+    local W = kitFullNoNetherite(mon)
+    runWorld(W, 30)
+    check(cell(mon, 79, 45).bg == colors.red, "bottom-right corner is the alert window")
+    local x1 = 79
+    while x1 > 1 and cell(mon, x1 - 1, 45).bg == colors.red do x1 = x1 - 1 end
+    local top = 45
+    while top > 1 and (cell(mon, 79, top - 1).bg == colors.red or cell(mon, 79, top - 1).bg == colors.yellow) do top = top - 1 end
+    check(x1 == 41, "half the monitor wide (columns " .. x1 .. "-79)")
+    check(cell(mon, 79, top).bg == colors.yellow and text(mon, top, x1):find("!!! 1 ALERT !!!", 1, true),
+        "yellow title bar: " .. text(mon, top, x1))
+    local body = {}
+    for y = top + 1, 45 do body[#body + 1] = text(mon, y, x1):gsub("^%s+", "") end
+    check(table.concat(body, " "):find("KIT FULL, but AE2 can't craft Insanite Blks: ME has no Netherite Blk", 1, true),
+        "the alert text is in the window: " .. table.concat(body, " "))
+    check(cell(mon, x1 - 1, 45).bg ~= colors.red, "nothing outside the window turns red")
+    check(cell(mon, 10, 1).bg == colors.gray and cell(mon, 1, 2).bg ~= colors.red and text(mon, 2):find("Insanite factory", 1, true),
+        "no banner: the stop buttons are still row 1 and the header is row 2")
+
+    -- The cause goes away: the window goes with it (after alertClearSeconds).
+    W.me.item[id("netherite_block")] = 500
+    runWorld(W, D.alertClearSeconds + 2 * D.cycleSeconds, nil, { continue = true })
+    check(#InsaniteFactory.alerts() == 0 and cell(mon, 79, 45).bg ~= colors.red, "alert cleared -> window gone")
+
+    -- A small monitor: the window never covers the buttons, and says what didn't fit.
+    local small = makeTerm(40, 6)
+    W = kitFullNoNetherite(small)
+    runWorld(W, 30)
+    local more = false
+    for y = 2, 6 do if text(small, y):find("more line", 1, true) then more = true end end
+    -- 40 columns: buttons 1-19 and 21-39
+    check(cell(small, 1, 1).bg == colors.gray and cell(small, 39, 1).bg == colors.gray, "row 1 still the stop buttons")
+    check(cell(small, 40, 2).bg == colors.yellow and more, "window fills rows 2-6 and ends with '... N more lines'")
+
+    -- The status file still lists the alerts at the top.
+    local f = fs.open(D.statusFile, "r")
+    local firstLine = f and f.readAll():match("^[^\n]*")
+    if f then f.close() end
+    check(firstLine == "!! 1 ALERT", "status file starts with the alerts: " .. tostring(firstLine))
+end
+
+--endregion
+
+--region 9c. machine at capacity
+
+print("machine at capacity: work that keeps waiting for a machine means it limits throughput")
+do
+    local model = InsanitePlanner.buildModel(D)
+    local need = InsanitePlanner.computeNeeds(model)
+    local function plan(stockOver, extra)
+        local stock = {}
+        for res in pairs(model.resources) do stock[res] = 0 end
+        stock.water, stock.uranium = 1e9, 1e6
+        for k, v in pairs(stockOver or {}) do stock[k] = v end
+        local sn = { stock = stock, pending = {}, busy = {}, running = {}, crafting = {}, craftable = {} }
+        for k, v in pairs(extra or {}) do sn[k] = v end
+        local _, _, _, waiting = InsanitePlanner.plan(D, model, need, sn)
+        return waiting
+    end
+    local function has(list, x) for _, v in ipairs(list or {}) do if v == x then return true end end return false end
+
+    local w = plan({ cyanite = 2, blutonium = 10, cyanite_fluid = 64000 },
+        { busy = { reprocessor = "running insanite" }, running = { reprocessor = "insanite" } })
+    check(has(w.reprocessor, "ludicrite") and has(w.reprocessor, "blutonium"),
+        "reprocessor running: ready recipes wait for it (" .. table.concat(w.reprocessor or {}, ", ") .. ")")
+    w = plan({ cyanite = 2, blutonium = 10, cyanite_fluid = 64000 }, { busy = { reprocessor = "stalled on insanite" } })
+    check(w.reprocessor == nil, "stalled machine: not counted (that's a fault, alerted separately)")
+    w = plan({ cyanite = 2, blutonium = 10, cyanite_fluid = 64000 }, { busy = { reprocessor = "loading stopped" } })
+    check(w.reprocessor == nil, "machines stop button: not counted")
+    w = plan({ cyanite = 2, blutonium = 10, cyanite_fluid = 64000 })
+    check(w.reprocessor and #w.reprocessor == 1 and w.reprocessor[1] == "blutonium",
+        "machine free: the furthest-behind recipe loads, the other ready one waits (" .. table.concat(w.reprocessor or {}, ", ") .. ")")
+    w = plan({ cyanite = 400 })
+    check(has(w.reprocessor, "blutonium"), "loaded to its limit with more wanted and in ME: counted as full")
+    w = plan({})
+    check(next(w) == nil, "nothing ready: nothing waits")
+
+    -- A plant shaped like yours: R5 is the limit (~0.7 mB/t), cyanite always available.
+    _G.__simClock = 0
+    local W = newWorld({ maxBurn = { [R5] = 0.7 } })
+    stockUp(W)
+    W.me.item[id("netherite_block")] = 1000
+    local up, maxQ = 0, 0
+    runWorld(W, 3 * 3600, nil, { onCycle = function(t)
+        W.me.item[id("cyanite")] = math.max(W.me.item[id("cyanite")] or 0, 300)
+        if t > 3600 then
+            for _, a in ipairs(InsaniteFactory.alerts()) do if a.key:find("^atcapacity") then up = up + 1 end end
+            for _, l in ipairs(InsaniteFactory.statusLines()) do
+                local q = l.text:match("^reprocessor.-queue (%d+)%%")
+                if q then maxQ = math.max(maxQ, tonumber(q)) end
+            end
+        end
+    end })
+    check(up == 0 and maxQ < D.machineAlertPct, string.format(
+        "R5-limited plant: no at-capacity alert after the first hour (reprocessor queue peaked at %d%%)", maxQ))
+
+    -- A slow fluidizer (40 s per operation): it limits verderium, and says so.
+    _G.__simClock = 0
+    W = newWorld({ fluidizerSeconds = 40 })
+    stockUp(W)
+    W.me.fluid[id("verderium")] = 0
+    local severity = {}
+    local savedAlarms = _G.AlarmManager
+    _G.AlarmManager = { raise = function(code, sev) severity[code] = sev end, clear = function() end }
+    runWorld(W, D.machineAlertSeconds + 120)
+    _G.AlarmManager = savedAlarms
+    local text
+    for _, a in ipairs(InsaniteFactory.alerts()) do if a.key == "atcapacity:fluidizer" then text = a.text end end
+    check(text and text:find("FLUIDIZER AT CAPACITY", 1, true) and text:find("verderium", 1, true)
+        and text:find("another fluidizer would raise it", 1, true), "alert: " .. tostring(text))
+    check(severity["insanite:atcapacity:fluidizer"] == "advisory", "raised in SCADA as advisory (a limit, not a fault)")
+    local row
+    for _, l in ipairs(InsaniteFactory.statusLines()) do if l.text:find("^fluidizer") then row = l.text end end
+    check(row and row:find("queue %d+%%"), "fluidizer row shows its queue: " .. tostring(row))
+
+    -- Machines stop button: the measurement restarts and the alert clears.
+    InsaniteFactory.setStopped("machines", true)
+    runWorld(W, D.alertClearSeconds + 2 * D.cycleSeconds, nil, { continue = true })
+    local still = false
+    for _, a in ipairs(InsaniteFactory.alerts()) do if a.key:find("^atcapacity") then still = true end end
+    check(not still, "machines stopped: at-capacity alert cleared")
+    InsaniteFactory.setStopped("machines", false)
+    runWorld(W, 60, nil, { continue = true })
+    row = nil
+    for _, l in ipairs(InsaniteFactory.statusLines()) do if l.text:find("^fluidizer") then row = l.text end end
+    check(row and row:find("warming up", 1, true), "restarted: needs a full window again before alerting (" .. tostring(row) .. ")")
+
+    -- Reactors pushed far past one reprocessor: wastes pile up, and the slowdown names the cause.
+    _G.__simClock = 0
+    W = newWorld({ maxBurn = { [R5] = 200, [R7] = 200 } })
+    stockUp(W)
+    local overflowText
+    runWorld(W, 2 * 3600, { plantBlocksPerHour = 40 }, { onCycle = function()
+        for _, a in ipairs(InsaniteFactory.alerts()) do if a.key == "overflow" then overflowText = overflowText or a.text end end
+    end })
+    check(overflowText and overflowText:find("Blocked: reprocessor at capacity", 1, true),
+        "overflow slowdown names the saturated machine: " .. tostring(overflowText))
+end
 
 --endregion
 
@@ -1230,10 +1553,10 @@ do
         "missing autocraft section -> ready-to-paste block: " .. show(e))
 
     e = check_(function(p) p.autocraft.insanite = true end)
-    check(has(e, "autocraft.insanite", "may only ask AE2 to craft cyanite_fluid, magentite_fluid."),
+    check(has(e, "autocraft.insanite", "may only ask AE2 to craft cyanite_fluid, insanite_block, magentite_fluid."),
         "crafting anything else is refused: " .. show(e))
     e = check_(function(p) p.autocraft.yellorium = true end)
-    check(has(e, "autocraft.yellorium", "may only ask AE2 to craft cyanite_fluid, magentite_fluid.", "Remove that line"),
+    check(has(e, "autocraft.yellorium", "may only ask AE2 to craft cyanite_fluid, insanite_block, magentite_fluid.", "Remove that line"),
         "a leftover yellorium autocraft line is refused: " .. show(e))
 
     e = check_(function(p) p.autocraft.magentite_fluid = nil end)
