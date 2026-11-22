@@ -261,6 +261,7 @@ end
 --   busy      = { [machineName] = reason string or nil },
 --   running   = { [machineName] = process id it holds, while busy },
 --   crafting  = { [res] = true while an AE2 job for it is running },
+--   craftsStopped = true while the machines stop button is on (no AE2 requests),
 --   craftable = { [res] = false when AE2 has no pattern for it },
 -- }
 -- Returns actions (list of { process, ops }), notes ({ [processId] = state text }), projected.
@@ -290,6 +291,8 @@ function Planner.plan(cfg, model, need, snap)
                 local fluid = (model.resources[p.output] or {}).kind == "fluid"
                 if not Planner.ALLOWED_CRAFTS[p.output] then
                     notes[p.id] = "not allowed"
+                elseif snap.craftsStopped then
+                    notes[p.id] = "crafts stopped"
                 elseif (snap.crafting or {})[p.output] then
                     notes[p.id] = "AE2 crafting"
                 elseif (snap.craftable or {})[p.output] == false then

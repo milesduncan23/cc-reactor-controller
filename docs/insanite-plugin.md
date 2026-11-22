@@ -214,17 +214,19 @@ can fire twice.
 | Button (gray = running) | When tapped (orange) | What it stops |
 | --- | --- | --- |
 | `[ STOP R5+R7 ]` | `[ R5+R7 STOPPED - START ]` | Every `"ratio"` reactor (R5 + R7) held at **exactly 100% rods**. R6 + R8 (`"stock"`) keep running exactly as before, cap and uranium floor included. |
-| `[ STOP MACHINE LOADING ]` | `[ LOADING STOPPED - START ]` | **Nothing goes into the reprocessor or fluidizer**, not even the stall top-ups. A batch already inside finishes on its own; a half-loaded machine waits. |
+| `[ STOP MACHINES + CRAFTS ]` | `[ MACHINES STOPPED - START ]` | **Nothing goes into the reprocessor or fluidizer**, not even the stall top-ups, and **no AE2 crafts** are requested. A batch already inside finishes on its own; a half-loaded machine waits. |
 
 - **The reactor stop always holds.** It doesn't depend on the ME Bridge or on the plugin's cycle:
   if the bridge disappears or a cycle errors, R5 + R7 stay fully in instead of falling back to the
-  core's energy control after `rodStaleSeconds`.
-- **AE2 crafts** (liquid cyanite, liquid magentite) only stock ME and load neither machine, so
-  neither button stops them.
+  core's energy control after `rodStaleSeconds`. When a reactor reconnects (the core builds a
+  fresh reactor object with its energy law), the stop is re-applied on that same event.
+- **AE2 crafts** (liquid cyanite, liquid magentite) stop with the machines button, and the recipes
+  read `crafts stopped`. The reactor button doesn't affect them.
 - **Your ME importers** are untouched by both.
 - **No alarms of their own:** while either stop is on there are no slowdown alerts, and R5 + R7
   raise no off-target alerts while stopped. The screen shows an orange line for each stop that's
-  on, recipes read `reprocessor loading stopped`, and R5 + R7 read `stopped (rods in)`.
+  on, recipes read `reprocessor loading stopped` (crafts: `crafts stopped`), and R5 + R7 read
+  `stopped (rods in)`.
 - **Survives reboots:** saved in `/insanite/paused` (`pauseFile`). Without a status monitor there
   are no buttons: delete that file and reboot to start everything again.
 
@@ -461,9 +463,10 @@ The test checks:
 - stop buttons: two separate blocks on the top row (taps on the gap, other rows or other
   monitors do nothing, a double-fired tap is ignored). The reactor button alone: R5 + R7 at
   exactly 100% rods burning nothing, R6 + R8 still burning, machines still loaded, no alerts. The
-  machine button: nothing loaded, recipes say why, AE2 crafts still requested. Both survive a
+  machine button: nothing loaded and no AE2 crafts, recipes say why. Both survive a
   reboot; R5 + R7 stay in with the ME Bridge gone and targets stale for 3 min; each undoes on its
-  own; the real wait loop reacts to a tap at once
+  own; the real wait loop reacts to a tap at once; a reconnected reactor gets the hold on the
+  same event
 - AE2 crafts: only the two allowed are ever requested, with typed item/fluid filters, sized to
   the shortfall, never repeated while running, never when `autocraft` is false, and a missing
   pattern is shown and named as the blocker

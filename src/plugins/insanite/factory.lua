@@ -13,8 +13,8 @@
 --
 -- Two stop buttons (top row of the status monitor), each on its own:
 --   reactors: "ratio" reactors (R5 + R7) held at 100% rods; "stock" reactors (R6 + R8) keep running.
---   machines: nothing loaded into the batch machines (not even stall top-ups).
--- AE2 crafts only stock ME and aren't affected by either. Both survive reboots (pauseFile).
+--   machines: nothing loaded into the batch machines (not even stall top-ups) and no AE2 crafts.
+-- Both survive reboots (pauseFile).
 --
 -- Runs beside the core controller (see hook.lua). Every peripheral call is pcall-guarded and
 -- a failed cycle is logged and retried, so a plugin fault cannot stop reactor control.
@@ -536,7 +536,7 @@ local function applyStops()
     end
 end
 
-local STOP_LABEL = { reactors = "reactors", machines = "machine loading" }
+local STOP_LABEL = { reactors = "reactors", machines = "machines + AE2 crafts" }
 
 local function setStopped(key, on, why)
     if STOP_LABEL[key] == nil then error("unknown stop button " .. tostring(key), 2) end
@@ -764,7 +764,7 @@ local function buildStatus()
     end
     local buttons = {
         button("reactors", "[ STOP " .. held .. " ]", "[ " .. held .. " STOPPED - START ]"),
-        button("machines", "[ STOP MACHINE LOADING ]", "[ LOADING STOPPED - START ]"),
+        button("machines", "[ STOP MACHINES + CRAFTS ]", "[ MACHINES STOPPED - START ]"),
     }
     lines[#lines + 1] = { text = buttons[1].text .. "  " .. buttons[2].text, color = colors.white,
         buttons = buttons }
@@ -786,7 +786,7 @@ local function buildStatus()
             reactorList("stock")), colors.orange, nil, true)
     end
     if stopped.machines then
-        add("Machine loading STOPPED by button: nothing goes into the reprocessor or fluidizer",
+        add("Machines STOPPED by button: nothing goes into the reprocessor or fluidizer, no AE2 crafts",
             colors.orange, nil, true)
     end
     if rateDetail then
@@ -1068,7 +1068,7 @@ function Factory.init(extraOverrides)
         .. ((stopped.reactors or stopped.machines) and string.format(
             "\nInsanite STOPPED by button:%s%s. Tap START on %s (or delete %s and reboot).",
             stopped.reactors and (" " .. reactorList("ratio") .. " reactors") or "",
-            stopped.machines and " machine loading" or "", tostring(cfg.monitor), tostring(cfg.pauseFile)) or "")
+            stopped.machines and " machines + AE2 crafts" or "", tostring(cfg.monitor), tostring(cfg.pauseFile)) or "")
     return cfg
 end
 
@@ -1149,17 +1149,20 @@ function Factory.cycle()
     rateTargets = burnTarget
 
     -- 4. Plan batch-machine loads and AE2 craft requests (reactor fuel is the ME importer's job).
-    --    Machine stop: every batch machine counts as busy ("loading stopped"), so nothing is
-    --    loaded; AE2 crafts are still planned.
+    --    Machine stop: every batch machine counts as busy ("loading stopped") and AE2 crafts are
+    --    off, so nothing is loaded or requested.
     local crafting, craftable = {}, {}
-    for _, p in ipairs(model.processes) do
-        if p.machine == "ae2" then
-            crafting[p.output] = isCrafting(p.output)
-            craftable[p.output] = isCraftable(p.output)
+    if not stopped.machines then
+        for _, p in ipairs(model.processes) do
+            if p.machine == "ae2" then
+                crafting[p.output] = isCrafting(p.output)
+                craftable[p.output] = isCraftable(p.output)
+            end
         end
     end
     local actions, notes, projected = InsanitePlanner.plan(cfg, model, need, {
         stock = stock, pending = pending, busy = busy, running = running, crafting = crafting, craftable = craftable,
+        craftsStopped = stopped.machines,
     })
 
     -- 5. Act.
@@ -1297,6 +1300,9 @@ function Factory.runForever()
         while true do
             local ev, a, b, c = os.pullEvent()
             if ev == "timer" and a == timer then break end
+            -- A reconnected reactor gets a fresh core object (energy law): re-apply the reactor
+            -- stop now rather than at the next cycle.
+            if ev == "peripheral" then pcall(applyStops) end
             if ev == "monitor_touch" and Factory.touch(a, b, c) then
                 pcall(render)
                 break

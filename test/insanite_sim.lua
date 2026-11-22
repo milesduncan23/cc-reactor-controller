@@ -911,13 +911,14 @@ end
 
 --region 8c. stop buttons
 
-print("stop buttons: one stops R5 + R7, the other stops machine loading; each on its own")
+print("stop buttons: one stops R5 + R7, the other stops machine loading + AE2 crafts; each on its own")
 do
     _G.__simClock = 0
     local W = newWorld()
     stockUp(W)
     local mon = makeTerm(70, 200)
-    peripheral.register("monitor_3", "monitor", mon)
+    local MON = D.monitor -- the status monitor named in insanite.conf
+    peripheral.register(MON, "monitor", mon)
     local function row(y)
         local out = {}
         for x = 1, mon._w do out[#out + 1] = (mon._grid[y][x] or { ch = " " }).ch end
@@ -955,18 +956,18 @@ do
     end
 
     runWorld(W, 600, nil, { craftEvery = 400 })
-    check(row(1):find("[ STOP R5+R7 ]", 1, true) and row(1):find("[ STOP MACHINE LOADING ]", 1, true),
+    check(row(1):find("[ STOP R5+R7 ]", 1, true) and row(1):find("[ STOP MACHINES + CRAFTS ]", 1, true),
         "top row holds two buttons: " .. row(1))
     check(mon._grid[1][REACTORS_X].bg == colors.gray and mon._grid[1][GAP_X] == nil and mon._grid[1][MACHINES_X].bg == colors.gray,
         "two separate blocks with a blank column between them")
     check(loads > 0, "running: the machines get loaded (" .. loads .. " loads)")
-    check(not touch("monitor_3", GAP_X, 1) and not touch("monitor_3", REACTORS_X, 4) and not touch("monitor_2", REACTORS_X, 1)
+    check(not touch(MON, GAP_X, 1) and not touch(MON, REACTORS_X, 4) and not touch("monitor_99", REACTORS_X, 1)
         and not stopped().reactors and not stopped().machines, "taps on the gap, another row or another monitor do nothing")
 
     -- 1. Reactor button only.
-    check(touch("monitor_3", REACTORS_X, 1) and stopped().reactors and not stopped().machines,
+    check(touch(MON, REACTORS_X, 1) and stopped().reactors and not stopped().machines,
         "reactor button -> R5 + R7 stopped, machine loading untouched")
-    check(not touch("monitor_3", REACTORS_X, 1) and stopped().reactors, "a second tap within 1 s (double-fired click) is ignored")
+    check(not touch(MON, REACTORS_X, 1) and stopped().reactors, "a second tap within 1 s (double-fired click) is ignored")
     check(fs.exists(D.pauseFile), "saved to " .. D.pauseFile)
     runWorld(W, 10, nil, { continue = true })
     local before = { r5 = burned(R5), r7 = burned(R7), r6 = burned(R6), r8 = burned(R8) }
@@ -977,7 +978,7 @@ do
     check(burned(R6) > before.r6 and burned(R8) > before.r8, string.format(
         "R6 + R8 keep burning (%.0f + %.0f mB in 10 min)", burned(R6) - before.r6, burned(R8) - before.r8))
     check(loads > loads0, "machines still loaded (" .. (loads - loads0) .. " loads)")
-    check(row(1):find("[ R5+R7 STOPPED - START ]", 1, true) and row(1):find("[ STOP MACHINE LOADING ]", 1, true),
+    check(row(1):find("[ R5+R7 STOPPED - START ]", 1, true) and row(1):find("[ STOP MACHINES + CRAFTS ]", 1, true),
         "only the reactor button changed: " .. row(1))
     check(mon._grid[1][REACTORS_X].bg == colors.orange and mon._grid[1][MACHINES_X].bg == colors.gray, "stopped button turns orange")
     check(statusHas("stopped (rods in)"), "reactor rows say stopped: " .. tostring(statusHas("stopped (rods in)")))
@@ -985,14 +986,14 @@ do
         "the stop raises no slowdown or off-target alerts")
 
     -- 2. Machine button as well.
-    check(touch("monitor_3", MACHINES_X, 1) and stopped().machines and stopped().reactors, "machine button -> loading stopped too")
+    check(touch(MON, MACHINES_X, 1) and stopped().machines and stopped().reactors, "machine button -> machines stopped too")
     runWorld(W, 10, nil, { continue = true })
     loads0 = loads
     runWorld(W, 600, nil, { continue = true, craftEvery = 400 })
     check(loads == loads0, "nothing loaded into the reprocessor or fluidizer (not even stall top-ups)")
     check(InsaniteFactory.lastNotes().blutonium == "reprocessor loading stopped",
         "recipes say why: " .. tostring(InsaniteFactory.lastNotes().blutonium))
-    check(row(1):find("[ LOADING STOPPED - START ]", 1, true), "machine button shows stopped: " .. row(1))
+    check(row(1):find("[ MACHINES STOPPED - START ]", 1, true), "machine button shows stopped: " .. row(1))
 
     -- Reboot with both on: both still on.
     InsaniteFactory.init()
@@ -1012,34 +1013,58 @@ do
 
     -- 3. Reactors back on, loading still stopped.
     InsaniteFactory.cycle()
-    check(touch("monitor_3", REACTORS_X, 1) and not stopped().reactors and stopped().machines,
+    check(touch(MON, REACTORS_X, 1) and not stopped().reactors and stopped().machines,
         "reactor button again -> R5 + R7 back on, loading still stopped")
     before.r5, before.r7, loads0 = burned(R5), burned(R7), loads
     runWorld(W, 600, nil, { continue = true })
     check(burned(R5) > before.r5 and burned(R7) > before.r7, "R5 + R7 burn again")
     check(loads == loads0, "while the machines still get nothing")
-    -- AE2 crafts only stock ME: neither button stops them.
+    -- The machine button stops AE2 crafts too, even with liquid cyanite short and cyanite in ME.
     W.me.fluid[id("cyanite_fluid")] = 0
     W.me.item[id("cyanite")] = 200
     local crafts0 = crafts()
     runWorld(W, 60, nil, { continue = true })
-    check(crafts() > crafts0, "AE2 crafts still requested with loading stopped")
+    check(crafts() == crafts0, "no AE2 craft requested while the machines are stopped")
+    check(InsaniteFactory.lastNotes()["craft cyanite_fluid"] == "crafts stopped",
+        "status says why: " .. tostring(InsaniteFactory.lastNotes()["craft cyanite_fluid"]))
 
-    -- 4. Loading back on.
-    check(touch("monitor_3", MACHINES_X, 1) and not stopped().machines and not fs.exists(D.pauseFile),
-        "machine button again -> loading back on, nothing stopped, file removed")
+    -- 4. Machines back on.
+    check(touch(MON, MACHINES_X, 1) and not stopped().machines and not fs.exists(D.pauseFile),
+        "machine button again -> machines back on, nothing stopped, file removed")
     loads0 = loads
     runWorld(W, 600, nil, { continue = true, craftEvery = 400 })
     check(loads > loads0, "machines get loaded again")
-    check(row(1):find("[ STOP R5+R7 ]", 1, true) and row(1):find("[ STOP MACHINE LOADING ]", 1, true), "both buttons back to STOP")
+    check(crafts() > crafts0, "and AE2 crafts are requested again")
+    check(row(1):find("[ STOP R5+R7 ]", 1, true) and row(1):find("[ STOP MACHINES + CRAFTS ]", 1, true), "both buttons back to STOP")
 
     -- The real wait loop: a tap is handled at once (next cycle runs straight away).
-    os.queueEvent("monitor_touch", "monitor_3", MACHINES_X, 1)
+    os.queueEvent("monitor_touch", MON, MACHINES_X, 1)
     local ok, err = pcall(InsaniteFactory.runForever)
     check(not ok and tostring(err):find("empty queue", 1, true) and stopped().machines and not stopped().reactors,
         "runForever: a monitor_touch on a button acts without waiting for the timer")
     InsaniteFactory.setStopped("machines", false)
-    check(not stopped().machines and not fs.exists(D.pauseFile), "cleanup: everything running")
+
+    -- Reactor reconnects while stopped: the core builds a fresh reactor object (energy law) when
+    -- it handles the "peripheral" event; the plugin re-applies the stop on that same event.
+    InsaniteFactory.setStopped("reactors", true)
+    local old = _G.reactors[R5]
+    local fresh = setmetatable({ id = R5, active = true, activelyCooled = false, rodLevel = old.rodLevel,
+        averageFuelUsage = 0, averageLastRFT = 0, powerWant = 0, setRodLevels = old.setRodLevels }, getmetatable(old))
+    local realPull = os.pullEvent
+    os.pullEvent = function(...)
+        local ev = table.pack(realPull(...))
+        if ev[1] == "peripheral" then _G.reactors[R5] = fresh end -- the core handles it first
+        return table.unpack(ev, 1, ev.n)
+    end
+    os.queueEvent("peripheral", R5)
+    pcall(InsaniteFactory.runForever)
+    os.pullEvent = realPull
+    check(rawget(fresh, "updateRods") == InsaniteRods._managedUpdateRods, "reconnected R5 gets the plugin's rod law at once")
+    fresh:updateRods()
+    check(W.reactors[R5].rod == 100, "and stays fully in, though the core would pull it out for power")
+    _G.reactors[R5] = old
+    InsaniteFactory.setStopped("reactors", false)
+    check(not stopped().reactors and not stopped().machines and not fs.exists(D.pauseFile), "cleanup: everything running")
 end
 
 --endregion
@@ -1159,7 +1184,7 @@ _G.AlarmManager = nil
 
 print("plant config check (network = the in-game `peripherals` list)")
 do
-    -- What `peripherals` shows on the controller computer (plus monitor_3, the status monitor).
+    -- What `peripherals` shows on the controller computer (plus the status monitor from insanite.conf).
     local NET = {
         bottom = { "me_bridge", "storage_bridge", "multi_drive" },
         top = { "modem", "peripheral_hub" },
@@ -1169,7 +1194,7 @@ do
         ["bigreactors:fluidizersolidinjector_0"] = { "bigreactors:fluidizersolidinjector", "inventory" },
         ["bigreactors:fluidizersolidinjector_1"] = { "bigreactors:fluidizersolidinjector", "inventory" },
         monitor_2 = { "monitor" },
-        monitor_3 = { "monitor" },
+        [D.monitor] = { "monitor" },
         left = { "monitor" },
         [R5] = { "BigReactors-Reactor" }, [R6] = { "BigReactors-Reactor" },
         [R7] = { "BigReactors-Reactor" }, [R8] = { "BigReactors-Reactor" },
@@ -1290,7 +1315,7 @@ do
     check(has(e, "stockBlocks must be a number", 'the text "2"'), "wrong type: " .. show(e))
 
     e, w = check_(function(p) p.monitor = "monitor_9" end)
-    check(#e == 0 and has(w, 'monitor = "monitor_9" is not on the wired network', "Monitors on the network now: monitor_2, monitor_3, left"),
+    check(#e == 0 and has(w, 'monitor = "monitor_9" is not on the wired network', "Monitors on the network now: monitor_2, " .. D.monitor .. ", left"),
         "device not on the network lists the real ones: " .. show(w))
 
     e = check_(function(p) p.monitor = nil end)
@@ -1328,7 +1353,7 @@ do
     check(plant == nil and has(errs, "syntax error", "/insanite.conf:", "missing comma"), "syntax error with line number: " .. show(errs))
 
     -- The plugin refuses to start and writes the full list where the player can read it.
-    writePlant((PLANT_TEXT:gsub('monitor = "monitor_3",', '', 1)))
+    writePlant((PLANT_TEXT:gsub('monitor = "' .. D.monitor .. '",', '', 1)))
     local ok, problem = pcall(InsaniteFactory.init)
     check(not ok and type(problem) == "table" and has(problem.plantErrors, "monitor is missing"), "init refuses to start on a bad config")
     local saved = print
