@@ -48,6 +48,12 @@ _G.INSANITE_DEFAULTS = {
     maxTrim = 0.25,           -- per-reactor ratio correction; 0 = strictly locked ratio
     trimGain = 0.25,
     overflowBlocks = 4,       -- a waste this far above target stops the plant (blocked downstream)
+    -- "stock" reactors (rodControl = "stock" in /insanite.conf) burn outside the lock: flat out
+    -- (or at stockMaxBurn) until ME holds stockCaps of their waste, then stop until ME has
+    -- dropped stockTaperPct below the cap. They also stop while ME holds less of their fuel than
+    -- stockFuelFloor (set per pool in /insanite.conf, e.g. 200000 uranium ingots).
+    stockTaperPct = 10,
+    stockFuelResumePct = 5,   -- after stopping at stockFuelFloor, resume once ME fuel is this % above it
     rodTau = 5,               -- seconds for the rods to settle on a new target
     rodKi = 5,                -- start-up step (rod-%/s) before the burn-per-% estimate exists
     rodDeadband = 0.02,       -- ignore burn-rate errors under 2%
@@ -62,7 +68,7 @@ _G.INSANITE_DEFAULTS = {
     -- worth and AE2 isn't already crafting it. `inputs`/`outQty` describe one craft so the
     -- ratios include what it consumes; match them to your AE2 pattern.
     crafts = {
-        yellorium       = { outQty = 1,    inputs = {} },                                  -- ingredients are up to AE2
+        yellorium       = { outQty = 1,    inputs = { { res = "uranium", qty = 1 } } },    -- made from uranium ingots
         cyanite_fluid   = { outQty = 1000, inputs = { { res = "cyanite", qty = 1 } } },    -- 1 cyanite ingot -> 1000 mB
         magentite_fluid = { outQty = 1000, inputs = { { res = "magentite", qty = 1 } } },  -- 1 magentite ingot -> 1000 mB
     },
@@ -91,6 +97,7 @@ _G.INSANITE_DEFAULTS = {
     -- Every item/fluid the factory touches. kind = "item" (counted in items) or "fluid" (mB).
     resources = {
         yellorium       = { kind = "item",  id = "bigreactors:yellorium_ingot",   label = "Yellorium" },
+        uranium         = { kind = "item",  id = "alltheores:uranium_ingot",      label = "Uranium" },  -- ATM10's unified uranium
         blutonium       = { kind = "item",  id = "bigreactors:blutonium_ingot",   label = "Blutonium" },
         cyanite         = { kind = "item",  id = "bigreactors:cyanite_ingot",     label = "Cyanite" },
         ludicrite       = { kind = "item",  id = "bigreactors:ludicrite_ingot",   label = "Ludicrite" },
@@ -148,6 +155,7 @@ _G.INSANITE_DEFAULTS = {
     -- fluid via a Fuel Injection Port).
     reactions = {
         yellorium = { "cyanite", "cyanite_fluid" },
+        uranium   = { "cyanite", "cyanite_fluid" },  -- Extreme Reactors burns uranium ingots as yellorium
         blutonium = { "magentite", "magentite_fluid" },
         verderium = { "rossinite" },
     },

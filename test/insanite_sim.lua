@@ -38,6 +38,11 @@ local function writePlant(text)
     local f = fs.open(INSANITE_DEFAULTS.plantFile, "w"); f.write(text); f.close()
 end
 local function id(res) return D.resources[res].id end
+-- Variant with R6 + R8 in the locked ratio instead of the stock pool (for the lock's own tests).
+local PLANT_TEXT_RATIO = PLANT_TEXT:gsub('waste = "cyanite", rodControl = "stock"', 'waste = "cyanite", rodControl = "ratio"')
+local D_RATIO = InsaniteFactory.deepMerge(InsaniteFactory.deepMerge(INSANITE_DEFAULTS, {}),
+    assert(load("return " .. PLANT_TEXT_RATIO, "=ratio", "t", {}))())
+D_RATIO.referenceReactor = R6
 local R5, R6, R7, R8 = "BigReactors-Reactor_5", "BigReactors-Reactor_6", "BigReactors-Reactor_7", "BigReactors-Reactor_8"
 -- Fuel per Insanite Block (x1000 mB) per reactor pool: cyanite pool = R6 + R8.
 local POOL_SHARE = { cyanite = 216, magentite = 16, rossinite = 24 }
@@ -60,14 +65,14 @@ do
         insanite = 8, inanite = 8, netherite_block = 1,
         benitoite = 128, rossinite = 24000, verderium = 24000, ridiculite = 16, ludicrite = 32,
         magentite_fluid = 16000, magentite = 16, cyanite_fluid = 32000, blutonium = 92, cyanite = 216,
-        water = 92000, yellorium = 240,
+        water = 92000, yellorium = 24, uranium = 240,
     }
     for res, value in pairs(expected) do
         check(math.abs((need[res] or -1) - value) < 1e-9, string.format("need %-16s = %s", res, value))
     end
     local expectedOps = { blutonium = 92, ludicrite = 32, ridiculite = 16, inanite = 8, insanite = 8, verderium = 12,
         ["reactors cyanite"] = 216, ["reactors magentite"] = 16, ["reactors rossinite"] = 24,
-        ["craft cyanite_fluid"] = 32, ["craft magentite_fluid"] = 16, ["craft yellorium"] = 240 }
+        ["craft cyanite_fluid"] = 32, ["craft magentite_fluid"] = 16, ["craft yellorium"] = 24 }
     for pid, value in pairs(expectedOps) do
         check(math.abs((ops[pid] or -1) - value) < 1e-9, string.format("ops %-22s = %s", pid, value))
     end
@@ -225,6 +230,10 @@ local function newWorld(opts)
         end
         if (opts.noPatterns or {})[gid] then return nil, "NOT_CRAFTABLE" end
         if pending(gid) then W.stats.craftDuplicates = W.stats.craftDuplicates + 1 end
+        if gid == id("yellorium") then
+            if (me.item[id("uranium")] or 0) < amount then return nil, "MISSING_ITEMS" end
+            add("item", id("uranium"), -amount)
+        end
         if gid == id("cyanite_fluid") or gid == id("magentite_fluid") then
             local ingot = (gid == id("cyanite_fluid")) and id("cyanite") or id("magentite")
             local need = math.ceil(amount / 1000)
@@ -350,7 +359,8 @@ local function newWorld(opts)
 end
 
 local function stockUp(W)
-    W.me.item[id("yellorium")] = 100000
+    W.me.item[id("uranium")] = 400000 -- above the 200k floor, so R6 + R8 may run
+    W.me.item[id("yellorium")] = 1000
     W.me.item[id("blutonium")] = 64
     W.me.fluid[id("verderium")] = 24000
     W.me.fluid[id("water")] = 1e12
@@ -386,7 +396,14 @@ end
 
 local function amount(W, res) return W.me[D.resources[res].kind][id(res)] or 0 end
 
--- Fuel burned per pool vs the recipe (cyanite pool = R6 + R8).
+-- Fuel burned by the locked pools (R5 : R7 = 16 : 24) when R6 + R8 are a stock pool.
+local function lockedRatioOk(W, tolerance)
+    local b5, b7 = W.reactors[R5].burnedTotal / 1000, W.reactors[R7].burnedTotal / 1000
+    local ok = b5 > 0 and math.abs((b7 / b5) / (24 / 16) - 1) <= tolerance
+    return ok, string.format("%.0f:%.0f", b5, b7)
+end
+
+-- Fuel burned per pool vs the recipe (cyanite pool = R6 + R8 in the ratio).
 local function burnRatioOk(W, tolerance)
     local b = {
         cyanite = (W.reactors[R6].burnedTotal + W.reactors[R8].burnedTotal) / 1000,
@@ -406,11 +423,11 @@ end
 
 --region 3. locked rate targets
 
-print("locked reactor rates")
+print("locked reactor rates (R6 + R8 in the ratio)")
 do
-    local model = InsanitePlanner.buildModel(D)
+    local model = InsanitePlanner.buildModel(D_RATIO)
     local need, ops = InsanitePlanner.computeNeeds(model)
-    local maxPace = InsanitePlanner.plantRate(D, model, ops)
+    local maxPace = InsanitePlanner.plantRate(D_RATIO, model, ops)
     check(math.abs(maxPace * 72000 - 0.9 * 72000 / 40 / 156) < 1e-6,
         string.format("max pace from the reprocessor: %.2f blocks/h", maxPace * 72000))
 
@@ -418,49 +435,49 @@ do
     local stock = {}
     for res, n in pairs(need) do stock[res] = D.stockBlocks * n end
     stock.insanite, stock.inanite = 0, 0
-    local t, d = InsanitePlanner.rateTargets(D, model, need, ops, stock, maxPace, {})
+    local t, d = InsanitePlanner.rateTargets(D_RATIO, model, need, ops, stock, maxPace, {})
     check(math.abs((t[R6] + t[R8]) / t[R5] - 216 / 16) < 1e-9 and math.abs(t[R7] / t[R5] - 24 / 16) < 1e-9,
         string.format("burn ratio (R6+R8):R5:R7 = 216:16:24 (%.2f:%.2f:%.2f mB/t)", t[R6] + t[R8], t[R5], t[R7]))
     check(math.abs(t[R6] - t[R8]) < 1e-9, "R6 and R8 split the cyanite pool evenly when neither is limited")
     check(d.demand == 1 and d.limit == "max pace", "empty kit -> full pace")
 
     stock.insanite, stock.inanite = D.stockBlocks * 8, D.stockBlocks * 8
-    t, d = InsanitePlanner.rateTargets(D, model, need, ops, stock, maxPace, {})
+    t, d = InsanitePlanner.rateTargets(D_RATIO, model, need, ops, stock, maxPace, {})
     check(d.rate == 0 and t[R6] == 0 and t[R5] == 0 and d.limit == "kit full", "full kit -> every reactor stops")
 
     stock.insanite, stock.inanite = (D.stockBlocks - 0.5) * 8, D.stockBlocks * 8
-    t, d = InsanitePlanner.rateTargets(D, model, need, ops, stock, maxPace, {})
+    t, d = InsanitePlanner.rateTargets(D_RATIO, model, need, ops, stock, maxPace, {})
     check(math.abs(d.rate / maxPace - 0.5) < 1e-9, "half a block short -> half pace (demandGain 1)")
 
     -- The slowest pool sets the pace for all.
     stock.insanite, stock.inanite = 0, 0
-    local full = InsanitePlanner.rateTargets(D, model, need, ops, stock, maxPace, {})
-    t, d = InsanitePlanner.rateTargets(D, model, need, ops, stock, maxPace, { [R5] = full[R5] / 2 })
+    local full = InsanitePlanner.rateTargets(D_RATIO, model, need, ops, stock, maxPace, {})
+    t, d = InsanitePlanner.rateTargets(D_RATIO, model, need, ops, stock, maxPace, { [R5] = full[R5] / 2 })
     check(math.abs(t[R5] - full[R5] / 2) < 1e-9 and math.abs(t[R6] - full[R6] / 2) < 1e-9 and math.abs(t[R7] - full[R7] / 2) < 1e-9,
         "reactor 5 at half its share -> yellorium & verderium reactors halve too")
     check(d.limit == "R5 max burn", "status names the limiting reactor (" .. d.limit .. ")")
 
     -- Inside the cyanite pool: a weak member is held at its max, the other takes the rest.
-    t, d = InsanitePlanner.rateTargets(D, model, need, ops, stock, maxPace, { [R8] = full[R8] / 4 })
+    t, d = InsanitePlanner.rateTargets(D_RATIO, model, need, ops, stock, maxPace, { [R8] = full[R8] / 4 })
     check(math.abs(t[R8] - full[R8] / 4) < 1e-9 and math.abs(t[R6] + t[R8] - (full[R6] + full[R8])) < 1e-9,
         "R8 limited -> R6 takes up the rest of the cyanite pool")
     check(d.rate == maxPace, "a single weak pool member doesn't slow the plant")
 
     -- Both members limited: the pool's combined max sets the pace, and the others follow.
     local poolMax = (full[R6] + full[R8]) / 4
-    t, d = InsanitePlanner.rateTargets(D, model, need, ops, stock, maxPace, { [R6] = poolMax * 0.7, [R8] = poolMax * 0.3 })
+    t, d = InsanitePlanner.rateTargets(D_RATIO, model, need, ops, stock, maxPace, { [R6] = poolMax * 0.7, [R8] = poolMax * 0.3 })
     check(math.abs(t[R6] + t[R8] - poolMax) < 1e-9 and math.abs(t[R5] - full[R5] / 4) < 1e-9 and d.limit == "R6+R8 max burn",
         "R6 + R8 both at max -> plant at their combined pace (" .. d.limit .. ")")
-    t = InsanitePlanner.rateTargets(D, model, need, ops, stock, maxPace, { [R7] = full[R7] / 3 })
+    t = InsanitePlanner.rateTargets(D_RATIO, model, need, ops, stock, maxPace, { [R7] = full[R7] / 3 })
     check(math.abs(t[R6] + t[R8] - (full[R6] + full[R8]) / 3) < 1e-9, "and vice versa: R7 at a third -> cyanite pool at a third")
 
     -- Trim: a surplus/shortage of one waste nudges only that pool, within +-maxTrim.
     stock.cyanite = (D.stockBlocks + 1) * need.cyanite
     stock.magentite = 0
-    t, d = InsanitePlanner.rateTargets(D, model, need, ops, stock, maxPace, {})
+    t, d = InsanitePlanner.rateTargets(D_RATIO, model, need, ops, stock, maxPace, {})
     check(math.abs(d.reactors[R6].trim - 0.75) < 1e-9 and math.abs(d.reactors[R5].trim - 1.25) < 1e-9,
         "cyanite surplus trims R6+R8 down, magentite shortage trims R5 up (clamped to 25%)")
-    local strict = InsanitePlanner.rateTargets(setmetatable({ maxTrim = 0 }, { __index = D }),
+    local strict = InsanitePlanner.rateTargets(setmetatable({ maxTrim = 0 }, { __index = D_RATIO }),
         model, need, ops, stock, maxPace, {})
     check(math.abs((strict[R6] + strict[R8]) / strict[R5] - 216 / 16) < 1e-9, "maxTrim = 0 -> strictly locked ratio despite the imbalance")
 
@@ -468,8 +485,58 @@ do
     stock.cyanite = D.stockBlocks * need.cyanite
     stock.magentite = D.stockBlocks * need.magentite
     stock.rossinite = (D.stockBlocks + D.overflowBlocks) * need.rossinite
-    t, d = InsanitePlanner.rateTargets(D, model, need, ops, stock, maxPace, {})
+    t, d = InsanitePlanner.rateTargets(D_RATIO, model, need, ops, stock, maxPace, {})
     check(d.rate == 0 and d.limit == "overflow rossinite", "rossinite piling up (no benitoite?) -> plant stops")
+end
+
+--endregion
+
+--region 3b. stock pool (R6 + R8 -> cyanite, outside the lock)
+
+print("stock pool: fills cyanite up to its cap, outside the locked ratio")
+do
+    local model = InsanitePlanner.buildModel(D)
+    local need, ops = InsanitePlanner.computeNeeds(model)
+    local maxPace = InsanitePlanner.plantRate(D, model, ops)
+    local FULL = InsanitePlanner.FULL_BURN
+    local cap = D.stockCaps.cyanite
+    local function stockAt(cyanite, uranium)
+        local st = {}
+        for res, n in pairs(need) do st[res] = D.stockBlocks * n end
+        st.insanite, st.inanite = 0, 0
+        st.cyanite, st.uranium = cyanite, uranium or 300000
+        return st
+    end
+    local state = {}
+    local t, d = InsanitePlanner.rateTargets(D, model, need, ops, stockAt(100), maxPace, {}, state)
+    check(t[R6] == FULL and t[R8] == FULL and d.stockPools.cyanite.state == "filling",
+        "cyanite below its cap -> R6 and R8 burn flat out")
+    check(d.pools.cyanite == nil and math.abs(t[R7] / t[R5] - 24 / 16) < 1e-9,
+        "the locked ratio is now just R5:R7 = 16:24")
+    t, d = InsanitePlanner.rateTargets(D, model, need, ops, stockAt(cap), maxPace, {}, state)
+    check(t[R6] == 0 and t[R8] == 0 and d.stockPools.cyanite.state == "at cap", "at the cap -> they stop")
+    t = InsanitePlanner.rateTargets(D, model, need, ops, stockAt(cap * 0.95), maxPace, {}, state)
+    check(t[R6] == 0, "5% under the cap -> still stopped (no flicker)")
+    t = InsanitePlanner.rateTargets(D, model, need, ops, stockAt(cap * 0.89), maxPace, {}, state)
+    check(t[R6] == FULL, "more than 10% under the cap -> burning again")
+    t, d = InsanitePlanner.rateTargets(D, model, need, ops, stockAt(100, 150000), maxPace, {}, state)
+    check(t[R6] == 0 and d.stockPools.cyanite.state == "holding" and d.stockPools.cyanite.reserve == 200000
+        and d.stockPools.cyanite.fuel == "uranium",
+        "ME uranium under the 200k floor from the config -> R6 + R8 stop")
+    t = InsanitePlanner.rateTargets(D, model, need, ops, stockAt(100, 205000), maxPace, {}, state)
+    check(t[R6] == 0, "still stopped at 205k (resumes 5% above the floor)")
+    t = InsanitePlanner.rateTargets(D, model, need, ops, stockAt(100, 211000), maxPace, {}, state)
+    check(t[R6] == FULL, "burning again at 211k uranium")
+    local capped = setmetatable({ stockMaxBurn = { cyanite = 20 } }, { __index = D })
+    t = InsanitePlanner.rateTargets(capped, model, need, ops, stockAt(100), maxPace, { [R8] = 4 }, {})
+    check(math.abs(t[R6] + t[R8] - 20) < 1e-9 and math.abs(t[R8] - 4) < 1e-9,
+        "stockMaxBurn = 20 -> R6 + R8 burn 20 mB/t together (R8 at its max 4, R6 the rest)")
+    t, d = InsanitePlanner.rateTargets(D, model, need, ops, stockAt(cap), maxPace, {}, {})
+    check(d.rate == maxPace and d.limitKind ~= "overflow",
+        "a full cyanite cap (way over 2 blocks' worth) doesn't trip the overflow guard")
+    local dev = InsanitePlanner.deviations(D, d, { [R5] = t[R5], [R7] = t[R7], [R6] = 50, [R8] = 50 })
+    check(dev.reactors[R6].stock and dev.reactors[R5].isRef and math.abs(dev.reactors[R7].dev) < 1e-9,
+        "dev column: R5 is the reference, stock reactors are left out")
 end
 
 --endregion
@@ -572,6 +639,8 @@ do
     local crafted = W.stats.crafted
     check(next(raised) == nil, "healthy plant raised no alerts (" .. tostring(next(raised) and raised[next(raised)]) .. ")")
     check(W.stats.badCrafts == 0 and W.stats.badFilters == 0, "AE2 only ever asked for the three allowed crafts, with typed filters")
+    check((W.peaks.cyanite or 0) >= D.stockCaps.cyanite and (W.peaks.cyanite or 0) <= D.stockCaps.cyanite + 64,
+        string.format("cyanite filled to its cap and no further (peak %d, cap %d)", W.peaks.cyanite or 0, D.stockCaps.cyanite))
     check((W.stats.craftRequests[id("cyanite_fluid")] or 0) > 0 and (W.stats.craftRequests[id("magentite_fluid")] or 0) > 0,
         string.format("liquid cyanite (%.0fB) and liquid magentite (%.0fB) came from AE2 crafts",
             (W.stats.craftRequests[id("cyanite_fluid")] or 0) / 1000, (W.stats.craftRequests[id("magentite_fluid")] or 0) / 1000))
@@ -579,16 +648,18 @@ do
     check(W.stats.mixed == 0 and W.stats.stuck == 0, "reprocessor never mixed recipes or got stuck")
     check(crafted >= 40, string.format("player crafted %d of 54 attempted blocks (max pace %.1f/h)", crafted,
         InsaniteFactory.plantRate() * 72000))
-    local ok, ratio = burnRatioOk(W, 0.10)
-    check(ok, "fuel burned cyanite:magentite:rossinite pools = " .. ratio .. " (recipe 216:16:24, within 10%)")
-    check(math.abs(W.reactors[R6].burnedTotal / W.reactors[R8].burnedTotal - 1) < 0.15,
-        "R6 and R8 shared the cyanite pool evenly")
+    local ok, ratio = lockedRatioOk(W, 0.10)
+    check(ok, "fuel burned R5:R7 = " .. ratio .. " (recipe 16:24, within 10%)")
+    local yell = (W.reactors[R6].burnedTotal + W.reactors[R8].burnedTotal) / 1000
+    check(yell > 216 / 16 * W.reactors[R5].burnedTotal / 1000,
+        string.format("R6 + R8 burned %.0f uranium, more than the %.0f the lock would have allowed",
+            yell, 216 / 16 * W.reactors[R5].burnedTotal / 1000))
     for _, res in ipairs({ "blutonium", "ludicrite", "ridiculite", "inanite", "insanite", "verderium",
         "cyanite_fluid", "magentite_fluid" }) do
         local limit = D.stockBlocks * need[res] + ((D.resources[res].kind == "fluid") and 32000 or 64)
         check((W.peaks[res] or 0) <= limit, string.format("%-15s peak %-7s <= %s", res, tostring(W.peaks[res]), tostring(limit)))
     end
-    for _, res in ipairs({ "cyanite", "magentite", "rossinite" }) do
+    for _, res in ipairs({ "magentite", "rossinite" }) do
         local limit = (D.stockBlocks + D.overflowBlocks) * need[res]
         check((W.peaks[res] or 0) <= limit, string.format("%-15s peak %-7s <= %s", res, tostring(W.peaks[res]), tostring(limit)))
     end
@@ -600,12 +671,12 @@ do
         insanite = amount(W, "insanite"), inanite = amount(W, "inanite") })
     check(kit >= D.stockBlocks - 0.15, string.format("kit refilled to %.2f of %d blocks", kit, D.stockBlocks))
     check(d.rate == 0 and d.limit == "kit full", "plant rate 0 once the kit is full")
-    local allIn = true
-    for _, R in pairs(W.reactors) do if R.rod < 99.9 then allIn = false end end
-    check(allIn, "all four reactors' rods fully inserted")
+    check(W.reactors[R5].rod >= 99.9 and W.reactors[R7].rod >= 99.9, "R5 and R7 rods fully inserted")
+    check(d.stockPools.cyanite.state == "at cap" and W.reactors[R6].rod >= 99.9,
+        "R6 + R8 stopped too, with cyanite at its cap")
 end
 
-print("weak blutonium reactor (1 mB/t max, needs 2.9): the yellorium reactors slow to match")
+print("weak blutonium reactor (1 mB/t max, needs 2.9): R7 slows to match; stock R6 + R8 don't")
 do
     _G.__simClock = 0
     local W = newWorld({ maxBurn = { [R5] = 1.0 } })
@@ -619,19 +690,19 @@ do
         end
     end })
     check(limitedTicks / cycles > 0.8, string.format("reactor 5 is the named limit %.0f%% of the time", 100 * limitedTicks / cycles))
-    local ok, ratio = burnRatioOk(W, 0.10)
-    check(ok, "fuel burned still in recipe ratio: " .. ratio)
-    check(W.reactors[R6].rod > 10, string.format("reactor 6 throttled to match (rods %.0f%% in, not flat out)", W.reactors[R6].rod))
+    local ok, ratio = lockedRatioOk(W, 0.10)
+    check(ok, "R5:R7 still in recipe ratio: " .. ratio)
+    check((W.peaks.cyanite or 0) >= D.stockCaps.cyanite, "R6 + R8 filled cyanite to its cap regardless (decoupled)")
     check(W.stats.mixed == 0 and W.stats.stuck == 0 and W.stats.badCrafts == 0, "no mixing, no stuck batches, no disallowed crafts")
 end
 
-print("weak R8 inside the cyanite pool (1 mB/t max): R6 picks up the slack, nothing slows")
+print("ratio mode: weak R8 inside the cyanite pool (1 mB/t max): R6 picks up the slack, nothing slows")
 do
     _G.__simClock = 0
     local W = newWorld({ maxBurn = { [R8] = 1.0 } })
     stockUp(W)
     local slowed = 0
-    runWorld(W, 4 * 3600, {}, { craftEvery = 400, onCycle = function(t)
+    runWorld(W, 4 * 3600, {}, { craftEvery = 400, plantText = PLANT_TEXT_RATIO, onCycle = function(t)
         local d = InsaniteFactory.rateDetail()
         if t > 3600 and d and d.limitKind == "capacity" then slowed = slowed + 1 end
     end })
@@ -640,6 +711,19 @@ do
         string.format("R6 burned %.0f vs R8 %.0f ingots", W.reactors[R6].burnedTotal / 1000, W.reactors[R8].burnedTotal / 1000))
     local ok, ratio = burnRatioOk(W, 0.10)
     check(ok, "pools still in recipe ratio: " .. ratio)
+end
+
+--endregion
+
+print("ratio mode: R6 + R8 locked with R5 and R7 (216:16:24)")
+do
+    _G.__simClock = 0
+    local W = newWorld()
+    stockUp(W)
+    runWorld(W, 4 * 3600, {}, { craftEvery = 400, plantText = PLANT_TEXT_RATIO })
+    local ok, ratio = burnRatioOk(W, 0.10)
+    check(ok, "fuel burned cyanite:magentite:rossinite pools = " .. ratio .. " (recipe 216:16:24, within 10%)")
+    check(math.abs(W.reactors[R6].burnedTotal / W.reactors[R8].burnedTotal - 1) < 0.15, "R6 and R8 shared the cyanite pool evenly")
 end
 
 --endregion
@@ -679,14 +763,14 @@ do
     local need = InsanitePlanner.computeNeeds(model)
     for res, n in pairs(need) do
         local def = D.resources[res]
-        if res ~= "water" and res ~= "benitoite" and res ~= "netherite_block" then
+        if res ~= "water" and res ~= "benitoite" and res ~= "netherite_block" and res ~= "uranium" then
             W.me[def.kind][def.id] = D.stockBlocks * n + ((res == "yellorium") and 1000 or 0)
         end
     end
     runWorld(W, 120)
-    local burned = false
-    for _, R in pairs(W.reactors) do if R.burnedTotal > 0 then burned = true end end
-    check(not burned, "no reactor burns while the kit is at target (the importer may still fill them)")
+    check(W.reactors[R5].burnedTotal == 0 and W.reactors[R7].burnedTotal == 0,
+        "locked reactors R5 and R7 don't burn while the kit is at target")
+    check(W.reactors[R6].burnedTotal > 0, "stock reactors R6 + R8 keep filling cyanite toward its cap")
     check(next(W.stats.craftRequests) == nil, "no AE2 craft requested while everything is at target")
     check(InsaniteFactory.lastNotes()["craft yellorium"] == "at target", "status says why")
 end
@@ -726,23 +810,23 @@ end
 
 --region 9. ratio deviation + alerts
 
-print("ratio deviation vs the reference reactor")
+print("ratio deviation vs the reference reactor (ratio mode)")
 do
-    local model = InsanitePlanner.buildModel(D)
+    local model = InsanitePlanner.buildModel(D_RATIO)
     local need, ops = InsanitePlanner.computeNeeds(model)
-    local maxPace = InsanitePlanner.plantRate(D, model, ops)
+    local maxPace = InsanitePlanner.plantRate(D_RATIO, model, ops)
     local stock = {}
     for res, n in pairs(need) do stock[res] = D.stockBlocks * n end
     stock.insanite, stock.inanite = 0, 0
-    local t, d = InsanitePlanner.rateTargets(D, model, need, ops, stock, maxPace, {})
+    local t, d = InsanitePlanner.rateTargets(D_RATIO, model, need, ops, stock, maxPace, {})
     local measured = { [R6] = t[R6], [R8] = t[R8], [R5] = t[R5] / 2, [R7] = t[R7] * 1.1 }
-    local dev = InsanitePlanner.deviations(D, d, measured)
+    local dev = InsanitePlanner.deviations(D_RATIO, d, measured)
     check(dev.ref == "cyanite" and dev.reactors[R6].isRef and dev.reactors[R8].isRef, "reference is R6's pool (R6+R8)")
     check(math.abs(dev.reactors[R5].dev + 0.5) < 1e-9 and math.abs(dev.reactors[R5].tracking + 0.5) < 1e-9,
         "R5 burning half its share -> -50% vs the cyanite pool and -50% vs its own target")
     check(math.abs(dev.reactors[R7].dev - 0.1) < 1e-9, "R7 10% fast -> +10%")
     measured[R6], measured[R8] = 0, 0
-    dev = InsanitePlanner.deviations(D, d, measured)
+    dev = InsanitePlanner.deviations(D_RATIO, d, measured)
     check(dev.ref == "magentite", "reference falls back to a burning pool when R6's is idle")
     local wrapped = InsaniteFactory.wrapText("PLANT SLOWED to 40%: Rossinite piling up in ME", 16, "  ")
     local fits, joined = true, {}
@@ -901,6 +985,29 @@ do
     e = check_(function(p) end)
     check(#e == 0, "R6 and R8 both making cyanite is fine (they form a pool)")
 
+    -- Stock pool settings
+    e = check_(function(p) p.stockCaps = nil end)
+    check(#e == 1 and has(e, "stockCaps is missing", "cyanite = 4096,", "R6+R8 burn until ME holds this"),
+        "stock reactors without a cap -> ready-to-paste block: " .. show(e))
+    e = check_(function(p) p.stockFuelFloor = nil end)
+    check(#e == 1 and has(e, "stockFuelFloor is missing", "cyanite = 200000,", "R6+R8 stop while ME holds less uranium than this (ingots)"),
+        "stock reactors without a fuel floor -> ready-to-paste block: " .. show(e))
+    e = check_(function(p) p.stockFuelFloor.cyanite = -1 end)
+    check(has(e, "stockFuelFloor.cyanite must be a number (0 or more)"), "bad fuel floor: " .. show(e))
+    e = check_(function(p) p.stockCaps.cyanite = "lots" end)
+    check(has(e, "stockCaps.cyanite must be a positive number", 'the text "lots"'), "bad cap: " .. show(e))
+    e = check_(function(p) p.reactors[R8].rodControl = "ratio" end)
+    check(has(e, 'Reactors making "cyanite" disagree: R6 is "stock" but R8 is "ratio"', "same rodControl"),
+        "half a pool in stock mode: " .. show(e))
+    e, w = check_(function(p) p.referenceReactor = R6 end)
+    check(#e == 0 and has(w, 'has rodControl = "stock"', 'referenceReactor = "BigReactors-Reactor_5",'),
+        "reference on a stock reactor -> warning naming a ratio one: " .. show(w))
+    e = check_(function(p) p.stockMaxBurn = { cyanite = -3 } end)
+    check(has(e, "stockMaxBurn.cyanite must be a positive number of mB/t"), "bad burn ceiling: " .. show(e))
+    e, w = check_(function(p) p.stockCaps.rossinite = 64000 end)
+    check(#e == 0 and has(w, 'stockCaps.rossinite is ignored: no reactor with rodControl = "stock" makes rossinite'),
+        "cap for a waste that isn't a stock pool: " .. show(w))
+
     -- Unchanged checks
     e = check_(function(p) p.bridge = nil end)
     check(has(e, "bridge is missing", 'bridge = "me_bridge_2",'), "missing bridge, suggests the real name: " .. show(e))
@@ -965,10 +1072,10 @@ do
     check(has(e, "referenceReactor", "is not one of the reactors"), "bad referenceReactor: " .. show(e))
 
     e = check_(function(p) p.reactors[R7].fuel = nil end)
-    check(has(e, ".fuel is missing", '"blutonium", "verderium", "yellorium"'), "missing fuel lists the choices: " .. show(e))
+    check(has(e, ".fuel is missing", '"blutonium", "uranium", "verderium", "yellorium"'), "missing fuel lists the choices: " .. show(e))
 
     e = check_(function(p) p.reactors[R7].rodControl = "rate" end)
-    check(has(e, 'must be "ratio" or "power"', "Did you mean ratio?"), "bad rodControl: " .. show(e))
+    check(has(e, 'must be "ratio", "stock" or "power"', "Did you mean ratio?"), "bad rodControl: " .. show(e))
 
     -- File-level problems, through the real loader.
     fs.delete(INSANITE_DEFAULTS.plantFile)

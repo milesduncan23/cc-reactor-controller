@@ -7,9 +7,11 @@
 --
 --   "ratio"  Rods track a target fuel burn rate (mB/t) from InsanitePlanner.rateTargets: one
 --            common plant rate x this reactor's fuel per Insanite Block. Energy is a by-product.
---   "power"  The core's energy law, sharing only the grid drain that "ratio" reactors don't
---            already cover with their by-product energy. Also used for reactors the plugin
---            doesn't manage.
+--   "stock"  Same rod law, but the target comes from the reactor's stock pool (fill ME with its
+--            waste up to a cap, flat out or at stockMaxBurn), outside the locked ratio.
+--   "power"  The core's energy law, sharing only the grid drain that "ratio"/"stock" reactors
+--            don't already cover with their by-product energy. Also used for reactors the
+--            plugin doesn't manage.
 --
 -- Max-burn learning: when a "ratio" reactor's rods are fully withdrawn for capacitySeconds and
 -- it still burns below target, its measured burn is recorded as its capacity. The planner then
@@ -28,7 +30,7 @@ local Rods = {}
 local settings = { ki = 5, tau = 5, kSmoothing = 2, deadband = 0.02, staleSeconds = 60,
     capacitySeconds = 30, minWrite = 0.1 }
 local enabled = false
-local modes = {}     -- reactorId -> "ratio" | "power"
+local modes = {}     -- reactorId -> "ratio" | "stock" | "power"
 local targets = {}   -- reactorId -> required burn, mB/t
 local scales = {}    -- reactorId -> its burn at full plant pace, mB/t (fallback step size)
 local noFuel = {}    -- reactorId -> true while the reactor has (almost) no fuel to burn
@@ -58,13 +60,13 @@ local function modeOf(id)
     return modes[id] or "power"
 end
 
--- Grid drain per energy-following passive reactor, minus what "ratio" reactors already make.
+-- Grid drain per energy-following passive reactor, minus what "ratio"/"stock" reactors make.
 local function powerShare()
     local s = _G.overallStats or {}
     local covered, followers = 0, 0
     for id, r in pairs(_G.reactors or {}) do
         if not r.activelyCooled then
-            if modeOf(id) == "ratio" then
+            if modeOf(id) ~= "power" then
                 covered = covered + (r.averageLastRFT or 0)
             else
                 followers = followers + 1
@@ -186,7 +188,7 @@ function Rods.configure(cfg)
     for id, r in pairs(cfg.reactors or {}) do
         if r then
             modes[id] = r.rodControl or "ratio"
-            if modes[id] == "ratio" then enabled = true end
+            if modes[id] ~= "power" then enabled = true end
         end
     end
     return enabled

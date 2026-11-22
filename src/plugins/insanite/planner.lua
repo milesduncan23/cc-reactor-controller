@@ -19,7 +19,9 @@
 -- furthest behind and a scarce shared input goes to the product that needs it most.
 --
 -- Reactors (locked rate): rateTargets() picks ONE plant rate (Insanite Blocks per tick) and
--- gives every reactor pool rate x its fuel per block, so the pools burn in exact recipe ratio.
+-- gives every "ratio" reactor pool rate x its fuel per block, so those pools burn in exact recipe
+-- ratio. "stock" pools (e.g. the yellorium reactors -> cyanite) are decoupled: they fill ME with
+-- their waste up to a cap from the config and are not part of the lock.
 -- The rate follows how far the finished kit in ME is below target, and is capped so no pool is
 -- asked for more than it can burn: the yellorium reactors burn exactly as much as the blutonium
 -- and verderium reactors can, and vice versa. Inside a pool, the target is split evenly, except
@@ -138,8 +140,11 @@ function Planner.buildModel(cfg)
     end
     for _, waste in ipairs(sortedKeys(members)) do
         local m = members[waste]
-        local rodControl = {}
-        for _, id in ipairs(m.ids) do rodControl[id] = cfg.reactors[id].rodControl or "ratio" end
+        local rodControl, isStock = {}, false
+        for _, id in ipairs(m.ids) do
+            rodControl[id] = cfg.reactors[id].rodControl or "ratio"
+            if rodControl[id] == "stock" then isStock = true end
+        end
         local label = {}
         for _, id in ipairs(m.ids) do label[#label + 1] = shortName(id) end
         order = order + 1
@@ -149,6 +154,7 @@ function Planner.buildModel(cfg)
             machine = "reactor",
             members = m.ids,
             rodControl = rodControl,
+            stock = isStock,
             output = waste,
             outQty = unitOf(model.resources[waste]),
             inputs = { { res = m.fuel, qty = unitOf(model.resources[m.fuel]) } },
@@ -395,8 +401,13 @@ end
 --   pools[waste]  = { label, members, cov, trim, share (mB fuel/block), capacity, capRate }
 --   reactors[id]  = { pool = waste, trim, cov, share (this member's mB fuel/block), capacity }
 -- capacities[id] = a reactor's measured max burn (mB/t), when known (see rods.lua).
-function Planner.rateTargets(cfg, model, need, ops, stock, plantMax, capacities)
+-- stockState = table the caller keeps between calls (stock pools' hysteresis state).
+-- Stock pools are reported in detail.stockPools[waste] = { label, members, cap, have, state,
+-- fuel, reserve, maxBurn }, and their reactors in detail.reactors with mode = "stock".
+Planner.FULL_BURN = 1e9 -- "as hard as it can": rods fully out
+function Planner.rateTargets(cfg, model, need, ops, stock, plantMax, capacities, stockState)
     capacities = capacities or {}
+    stockState = stockState or {}
     local K = cfg.stockBlocks or 2
     local kit = Planner.kitCoverage(model, stock)
     local demand = clamp((cfg.demandGain or 1) * (K - kit), 0, 1)
@@ -411,7 +422,7 @@ function Planner.rateTargets(cfg, model, need, ops, stock, plantMax, capacities)
 
     local pools = {}
     for _, p in ipairs(model.processes) do
-        if p.machine == "reactor" then
+        if p.machine == "reactor" and not p.stock then
             local ratioIds = {}
             for _, id in ipairs(p.members) do
                 if p.rodControl[id] ~= "power" then ratioIds[#ratioIds + 1] = id end
@@ -453,7 +464,7 @@ function Planner.rateTargets(cfg, model, need, ops, stock, plantMax, capacities)
 
     local targets = {}
     local detail = { rate = rate, demand = demand, kit = kit, limit = limit, limitKind = limitKind,
-        limitId = limitId, unconstrained = plantMax * demand, pools = {}, reactors = {} }
+        limitId = limitId, unconstrained = plantMax * demand, pools = {}, reactors = {}, stockPools = {} }
     for _, pool in ipairs(pools) do
         local poolTarget = rate * pool.share * pool.trim
         local alloc = splitPool(poolTarget, pool.members, capacities)
@@ -461,10 +472,62 @@ function Planner.rateTargets(cfg, model, need, ops, stock, plantMax, capacities)
             targets[id] = alloc[id]
             -- this member's slice of the pool's fuel per block (alloc / rate / trim)
             local fraction = (poolTarget > 0) and (alloc[id] / poolTarget) or (1 / #pool.members)
-            detail.reactors[id] = { pool = pool.waste, trim = pool.trim, cov = pool.cov,
+            detail.reactors[id] = { pool = pool.waste, mode = "ratio", trim = pool.trim, cov = pool.cov,
                 share = pool.share * fraction, capacity = capacities[id] }
         end
         detail.pools[pool.waste] = pool
+    end
+
+    -- Stock pools: decoupled from the lock. Each fills ME with its waste up to its cap
+    -- (stockCaps), burning flat out (or at stockMaxBurn for the whole pool), with hysteresis:
+    -- it stops at the cap and restarts once ME is stockTaperPct below it. It also stops while ME
+    -- holds less of its fuel than stockFuelFloor (plant config), resuming stockFuelResumePct
+    -- above it, so it can't burn through fuel you need elsewhere.
+    for _, p in ipairs(model.processes) do
+        if p.machine == "reactor" and p.stock then
+            local ids = {}
+            for _, id in ipairs(p.members) do
+                if p.rodControl[id] == "stock" then ids[#ids + 1] = id end
+            end
+            local cap = (cfg.stockCaps or {})[p.output] or 0
+            local have = stock[p.output] or 0
+            local restartAt = cap * (1 - (cfg.stockTaperPct or 10) / 100)
+            local state = stockState[p.output] or "filling"
+            if have >= cap then state = "at cap" elseif have <= restartAt then state = "filling" end
+
+            -- Fuel floor from the plant config (stockFuelFloor): stop while ME holds less of this
+            -- pool's fuel than that, resume stockFuelResumePct above it.
+            local fuel = p.inputs[1].res
+            local reserve = tonumber((cfg.stockFuelFloor or {})[p.output]) or 0
+            local fuelHave = stock[fuel] or 0
+            local hold = stockState[p.output .. ":fuel"] == true
+            if fuelHave < reserve then
+                hold = true
+            elseif fuelHave >= reserve * (1 + (cfg.stockFuelResumePct or 5) / 100) then
+                hold = false
+            end
+            stockState[p.output], stockState[p.output .. ":fuel"] = state, hold
+
+            local maxBurn = (cfg.stockMaxBurn or {})[p.output]
+            if type(maxBurn) ~= "number" or maxBurn <= 0 then maxBurn = nil end
+            local alloc = {}
+            if state == "filling" and not hold then
+                if maxBurn then
+                    alloc = splitPool(maxBurn, ids, capacities)
+                else
+                    for _, id in ipairs(ids) do alloc[id] = Planner.FULL_BURN end
+                end
+            end
+            local share = (ops[p.id] or 0) * 1000
+            for _, id in ipairs(ids) do
+                targets[id] = alloc[id] or 0
+                detail.reactors[id] = { pool = p.output, mode = "stock", trim = 1, share = share / #ids,
+                    capacity = capacities[id] }
+            end
+            detail.stockPools[p.output] = { waste = p.output, label = p.label, members = ids, cap = cap,
+                have = have, restartAt = restartAt, state = hold and "holding" or state, fuel = fuel,
+                reserve = reserve, maxBurn = maxBurn }
+        end
     end
     return targets, detail
 end
@@ -489,7 +552,8 @@ function Planner.deviations(cfg, detail, measured)
     local refPool
     local refId = cfg.referenceReactor
     local refEntry = refId and detail.reactors[refId]
-    if refEntry and paceOf(detail.pools[refEntry.pool]) > 0 then refPool = detail.pools[refEntry.pool] end
+    local refCandidate = refEntry and detail.pools[refEntry.pool] -- nil for stock/power reactors
+    if refCandidate and paceOf(refCandidate) > 0 then refPool = refCandidate end
     if not refPool then
         for _, waste in ipairs(sortedKeys(detail.pools)) do
             if paceOf(detail.pools[waste]) > 0 then refPool = detail.pools[waste]; break end
@@ -507,12 +571,16 @@ function Planner.deviations(cfg, detail, measured)
         out.pools[waste] = e
     end
     for id, r in pairs(detail.reactors) do
-        local pe = out.pools[r.pool] or {}
-        local target = detail.rate * r.share * r.trim
-        local e = { dev = pe.dev, expected = pe.expected, isRef = pe.isRef, target = target,
-            measured = measured[id] or 0 }
-        if target > 0 then e.tracking = (measured[id] or 0) / target - 1 end
-        out.reactors[id] = e
+        if r.mode == "stock" then
+            out.reactors[id] = { stock = true, measured = measured[id] or 0 }
+        else
+            local pe = out.pools[r.pool] or {}
+            local target = detail.rate * r.share * r.trim
+            local e = { dev = pe.dev, expected = pe.expected, isRef = pe.isRef, target = target,
+                measured = measured[id] or 0 }
+            if target > 0 then e.tracking = (measured[id] or 0) / target - 1 end
+            out.reactors[id] = e
+        end
     end
     return out
 end
@@ -521,11 +589,13 @@ end
 
 local SIDES = { top = true, bottom = true, left = true, right = true, front = true, back = true }
 local DEVICE_KEYS = { bridge = true, monitor = true, referenceReactor = true, machines = true, reactors = true,
-    autocraft = true }
+    autocraft = true, stockCaps = true, stockMaxBurn = true, stockFuelFloor = true }
 local MACHINE_KEYS = { "ports", "output" }
 local REACTOR_KEYS = { "fuel", "waste", "rodControl", "outlet" }
 local RETIRED_REACTOR_KEYS = { inlet = "fuel is fed by your own ME importer, not the plugin" }
-local ROD_MODES = { "ratio", "power" }
+local ROD_MODES = { "ratio", "stock", "power" }
+local ROD_MODE_HELP = '"ratio" (burns at its share of the locked plant rate), "stock" (fills ME with its waste up to '
+    .. 'stockCaps, outside the lock) or "power" (stays on the core\'s energy-demand control)'
 
 local function q(v) return string.format("%q", tostring(v)) end
 
@@ -920,13 +990,13 @@ function Planner.validatePlant(plant, defaults, network)
                 end
 
                 if r.rodControl == nil then
-                    err(path .. '.rodControl is missing: "ratio" (burns at its share of the locked plant rate) or "power" (stays on the core\'s energy-demand control).',
+                    err(path .. ".rodControl is missing: " .. ROD_MODE_HELP .. ".",
                         "Add inside " .. path .. ':   rodControl = "ratio",')
                 else
                     local okMode = false
                     for _, m in ipairs(ROD_MODES) do if r.rodControl == m then okMode = true end end
                     if not okMode then
-                        err(path .. ".rodControl = " .. q(r.rodControl) .. ' must be "ratio" or "power".'
+                        err(path .. ".rodControl = " .. q(r.rodControl) .. ' must be "ratio", "stock" or "power".'
                             .. didYouMean(tostring(r.rodControl), ROD_MODES))
                     end
                 end
@@ -941,6 +1011,135 @@ function Planner.validatePlant(plant, defaults, network)
             end
         end
 
+    end
+
+    -- Stock pools: every reactor making one waste must agree on "stock", and each stock waste
+    -- needs a cap. stockMaxBurn (optional) caps the pool's total burn.
+    local stockWastes, stockFuel = {}, {}
+    if type(plant.reactors) == "table" then
+        local modesByWaste = {}
+        for _, id in ipairs(keysOf(plant.reactors)) do
+            local r = plant.reactors[id]
+            if type(r) == "table" and type(r.waste) == "string" and type(r.rodControl) == "string" then
+                modesByWaste[r.waste] = modesByWaste[r.waste] or {}
+                table.insert(modesByWaste[r.waste], { id = id, mode = r.rodControl, fuel = r.fuel })
+            end
+        end
+        for _, waste in ipairs(keysOf(modesByWaste)) do
+            local list, stockIds, otherIds = modesByWaste[waste], {}, {}
+            for _, e in ipairs(list) do
+                if e.mode == "stock" then
+                    stockIds[#stockIds + 1] = shortName(e.id)
+                    if type(e.fuel) == "string" then stockFuel[waste] = e.fuel end
+                elseif e.mode == "ratio" then otherIds[#otherIds + 1] = shortName(e.id) end
+            end
+            if #stockIds > 0 and #otherIds > 0 then
+                err("Reactors making " .. q(waste) .. " disagree: " .. table.concat(stockIds, "+")
+                    .. (#stockIds > 1 and ' are' or ' is') .. ' "stock" but '
+                    .. table.concat(otherIds, "+") .. (#otherIds > 1 and ' are' or ' is') .. ' "ratio".',
+                    "Reactors that share a waste work as one pool: give them all the same rodControl.")
+            elseif #stockIds > 0 then
+                stockWastes[waste] = table.concat(stockIds, "+")
+            end
+        end
+    end
+    local function stockExample(waste)
+        local kind = (resources[waste] or {}).kind
+        return waste .. " = " .. (kind == "fluid" and "64000" or "4096") .. ","
+            .. (kind == "fluid" and "   (mB)" or "   (ingots)")
+    end
+    if next(stockWastes) then
+        if plant.stockCaps == nil or plant.stockCaps == false then
+            local lines = { "stockCaps is missing: how much of each \"stock\" reactor's waste to keep in ME.",
+                "Add to the top-level table:   stockCaps = {" }
+            for _, waste in ipairs(keysOf(stockWastes)) do
+                local several = stockWastes[waste]:find("+", 1, true) ~= nil
+                lines[#lines + 1] = "  " .. stockExample(waste) .. "   -- " .. stockWastes[waste]
+                    .. (several and " burn" or " burns") .. " until ME holds this"
+            end
+            lines[#lines + 1] = "},"
+            err(table.unpack(lines))
+        elseif type(plant.stockCaps) ~= "table" then
+            err("stockCaps must be a table like { cyanite = 4096 }, but it is " .. describe(plant.stockCaps) .. ".")
+        else
+            for _, waste in ipairs(keysOf(stockWastes)) do
+                local v = plant.stockCaps[waste]
+                if v == nil then
+                    local several = stockWastes[waste]:find("+", 1, true) ~= nil
+                    err("stockCaps." .. waste .. " is missing: how much " .. waste .. " " .. stockWastes[waste]
+                        .. (several and " keep" or " keeps") .. " in ME ("
+                        .. (several and "they burn" or "it burns") .. " until ME holds this, then stop" .. (several and "" or "s") .. ").",
+                        "Add inside stockCaps:   " .. stockExample(waste))
+                elseif type(v) ~= "number" or v <= 0 then
+                    err("stockCaps." .. waste .. " must be a positive number, but it is " .. describe(v) .. ".")
+                end
+            end
+            for _, waste in ipairs(keysOf(plant.stockCaps)) do
+                if not stockWastes[waste] then
+                    warn("stockCaps." .. tostring(waste) .. " is ignored: no reactor with rodControl = \"stock\" makes "
+                        .. tostring(waste) .. "." .. didYouMean(tostring(waste), keysOf(stockWastes)))
+                end
+            end
+        end
+    elseif type(plant.stockCaps) == "table" and next(plant.stockCaps) then
+        warn("stockCaps is ignored: no reactor has rodControl = \"stock\".")
+    end
+
+    -- Fuel floor per stock pool: it stops while ME holds less of its fuel than this.
+    local function floorExample(waste)
+        local fuel = stockFuel[waste] or "fuel"
+        local kind = (resources[fuel] or {}).kind
+        return waste .. " = " .. (kind == "fluid" and "64000" or "200000") .. ",   -- "
+            .. stockWastes[waste] .. " stop while ME holds less " .. fuel .. " than this"
+            .. (kind == "fluid" and " (mB)" or " (ingots)")
+    end
+    if next(stockWastes) then
+        if plant.stockFuelFloor == nil or plant.stockFuelFloor == false then
+            local lines = { "stockFuelFloor is missing: the least of each \"stock\" pool's fuel to leave in ME "
+                .. "(the pool stops below it, so it can't use up fuel you need elsewhere).",
+                "Add to the top-level table:   stockFuelFloor = {" }
+            for _, waste in ipairs(keysOf(stockWastes)) do lines[#lines + 1] = "  " .. floorExample(waste) end
+            lines[#lines + 1] = "},"
+            err(table.unpack(lines))
+        elseif type(plant.stockFuelFloor) ~= "table" then
+            err("stockFuelFloor must be a table like { cyanite = 200000 }, but it is " .. describe(plant.stockFuelFloor) .. ".")
+        else
+            for _, waste in ipairs(keysOf(stockWastes)) do
+                local v = plant.stockFuelFloor[waste]
+                if v == nil then
+                    err("stockFuelFloor." .. waste .. " is missing: how much " .. (stockFuel[waste] or "fuel")
+                        .. " must stay in ME before " .. stockWastes[waste] .. " stop (0 = no floor).",
+                        "Add inside stockFuelFloor:   " .. floorExample(waste))
+                elseif type(v) ~= "number" or v < 0 then
+                    err("stockFuelFloor." .. waste .. " must be a number (0 or more), but it is " .. describe(v) .. ".")
+                end
+            end
+            for _, waste in ipairs(keysOf(plant.stockFuelFloor)) do
+                if not stockWastes[waste] then
+                    warn("stockFuelFloor." .. tostring(waste) .. " is ignored: no reactor with rodControl = \"stock\" makes "
+                        .. tostring(waste) .. "." .. didYouMean(tostring(waste), keysOf(stockWastes)))
+                end
+            end
+        end
+    elseif type(plant.stockFuelFloor) == "table" and next(plant.stockFuelFloor) then
+        warn("stockFuelFloor is ignored: no reactor has rodControl = \"stock\".")
+    end
+    if plant.stockMaxBurn ~= nil and plant.stockMaxBurn ~= false then
+        if type(plant.stockMaxBurn) ~= "table" then
+            err("stockMaxBurn must be a table like { cyanite = 20 } (mB/t for the whole pool), but it is "
+                .. describe(plant.stockMaxBurn) .. ".")
+        else
+            for _, waste in ipairs(keysOf(plant.stockMaxBurn)) do
+                local v = plant.stockMaxBurn[waste]
+                if not stockWastes[waste] then
+                    warn("stockMaxBurn." .. tostring(waste) .. " is ignored: no reactor with rodControl = \"stock\" makes "
+                        .. tostring(waste) .. ".")
+                elseif v ~= false and (type(v) ~= "number" or v <= 0) then
+                    err("stockMaxBurn." .. waste .. " must be a positive number of mB/t (or false for flat out), but it is "
+                        .. describe(v) .. ".")
+                end
+            end
+        end
     end
 
     -- AE2 autocraft: exactly which of the three allowed crafts are on. Must be stated explicitly.
@@ -1073,10 +1272,21 @@ function Planner.validatePlant(plant, defaults, network)
     -- Reference reactor for the deviation column (optional).
     if plant.referenceReactor ~= nil and plant.referenceReactor ~= false
         and type(plant.reactors) == "table" and next(plant.reactors) ~= nil then -- else already reported
-        if plant.reactors[plant.referenceReactor] == nil then
+        local ref = plant.reactors[plant.referenceReactor]
+        if ref == nil then
             err("referenceReactor = " .. q(plant.referenceReactor) .. " is not one of the reactors defined in reactors ("
                 .. quoted(keysOf(type(plant.reactors) == "table" and plant.reactors or {})) .. ")."
                 .. didYouMean(tostring(plant.referenceReactor), keysOf(type(plant.reactors) == "table" and plant.reactors or {})))
+        elseif type(ref) == "table" and (ref.rodControl == "stock" or ref.rodControl == "power") then
+            local ratioIds = {}
+            for _, id in ipairs(keysOf(plant.reactors)) do
+                local r = plant.reactors[id]
+                if type(r) == "table" and r.rodControl == "ratio" then ratioIds[#ratioIds + 1] = id end
+            end
+            warn("referenceReactor = " .. q(plant.referenceReactor) .. " has rodControl = " .. q(ref.rodControl)
+                .. ", so it isn't part of the locked ratio; the dev column will use another reactor instead.",
+                #ratioIds > 0 and ("Set it to one of the ratio reactors:   referenceReactor = " .. q(ratioIds[1]) .. ",")
+                    or "No reactor uses rodControl = \"ratio\", so there is no ratio to compare.")
         end
     end
 

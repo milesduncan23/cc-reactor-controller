@@ -20,6 +20,7 @@ local cfg, model, need, opsPerBlock
 local plantRate = 0          -- Insanite Blocks per tick the rod targets are sized for
 local rateTargets = {}       -- reactorId -> burn target mB/t (rod control)
 local rateDetail = nil       -- last InsanitePlanner.rateTargets detail (plant rate, limit, trims)
+local stockState = {}        -- stock pools' on/off (hysteresis) state, kept between cycles
 local machineState = {}      -- machineName -> { process, ops, busy, sig, changedAt, stalled, contents }
 local reactorInfo = {}       -- reactorId -> last stats
 local lastEject = {}         -- reactorId -> clock
@@ -549,8 +550,21 @@ local function buildAlerts(notes)
         local r = d and d.reactors[id]
         local floor = r and 0.1 * plantRate * r.share or 0
         local measuredBurn = e.measured or 0
-        local off = (e.target > 0) and math.abs(measuredBurn - e.target) / math.max(e.target, floor) or 0
-        if e.tracking and off > limit then
+        local off = (e.target and e.target > 0) and math.abs(measuredBurn - e.target) / math.max(e.target, floor) or 0
+        if e.stock then
+            -- Stock reactors burn flat out by design; only an empty tank while filling is a fault.
+            local pool = d and d.stockPools[r.pool]
+            local info = reactorInfo[id] or {}
+            if pool and pool.state == "filling" and info.present and (info.fuelAmount or 0) < 1000 then
+                trackSince[id] = trackSince[id] or now()
+                if now() - trackSince[id] >= window then
+                    add("track:" .. id, string.format("%s out of fuel while filling %s to its cap (check its ME importer)",
+                        shortId(id), pool.waste))
+                end
+            else
+                trackSince[id] = nil
+            end
+        elseif e.tracking and off > limit then
             trackSince[id] = trackSince[id] or now()
             if now() - trackSince[id] >= window then
                 local info = reactorInfo[id] or {}
@@ -615,6 +629,13 @@ end
 
 --region status
 
+local function sortedKeysOf(t)
+    local keys = {}
+    for k in pairs(t or {}) do keys[#keys + 1] = k end
+    table.sort(keys)
+    return keys
+end
+
 local function fmtAmount(def, amount)
     amount = amount or 0
     if def.kind == "fluid" then
@@ -646,6 +667,23 @@ local function buildStatus()
         add(string.format("Plant %.1f of %.1f blk/h   limit: %s",
             rateDetail.rate * 72000, plantRate * 72000, shortId(rateDetail.limit)),
             rateDetail.rate > 0 and colors.lime or colors.lightGray)
+        for _, waste in ipairs(sortedKeysOf(rateDetail.stockPools)) do
+            local sp = rateDetail.stockPools[waste]
+            local def = cfg.resources[waste]
+            local why = sp.state
+            if sp.state == "holding" then
+                local fdef = cfg.resources[sp.fuel]
+                why = string.format("stopped: ME %s %s is under the %s floor (resumes at %s)",
+                    (fdef.label or sp.fuel):lower(), fmtAmount(fdef, lastStock[sp.fuel]), fmtAmount(fdef, sp.reserve),
+                    fmtAmount(fdef, sp.reserve * (1 + (cfg.stockFuelResumePct or 5) / 100)))
+            elseif sp.state == "at cap" then
+                why = "at cap, restarts below " .. fmtAmount(def, sp.restartAt)
+            end
+            add(string.format("Stock %s (%s) -> %s %s/%s: %s%s", sp.label, sp.fuel, waste, fmtAmount(def, sp.have),
+                fmtAmount(def, sp.cap),
+                why, sp.maxBurn and string.format(" (max %.1f mB/t)", sp.maxBurn) or ""),
+                sp.state == "filling" and colors.cyan or colors.lightGray, nil, true)
+        end
     end
 
     if #plantWarnings > 0 then
@@ -675,11 +713,14 @@ local function buildStatus()
         if n > 0 then
             local produced = model.producerOf[res] ~= nil
             local cov = (lastProjected[res] or 0) / n
+            local sp = rateDetail and rateDetail.stockPools[res]
+            local target = produced and string.format("%.1f/%g", cov, K) or "raw"
+            if sp then target = "cap " .. fmtAmount(def, sp.cap) end
             local text = string.format("%-14s %8s %8s  %s", def.label or res,
-                fmtAmount(def, lastStock[res]), fmtAmount(def, n),
-                produced and string.format("%.1f/%g", cov, K) or "raw")
+                fmtAmount(def, lastStock[res]), fmtAmount(def, n), target)
             local color = colors.white
             if produced then color = (cov >= K) and colors.lime or colors.orange end
+            if sp then color = colors.cyan end
             if not produced and (lastStock[res] or 0) < n then color = colors.red end
             add(text, color)
         end
@@ -709,6 +750,7 @@ local function buildStatus()
                 local rod = _G.InsaniteRods and InsaniteRods.state(id) or {}
                 local r = rateDetail and rateDetail.reactors[id]
                 local target = rateTargets[id] or 0
+                local sp = rateDetail and rateDetail.stockPools[p.output]
                 local fuel = (info.present and (info.fuelCapacity or 0) > 0)
                     and string.format("%3d%%", math.floor(info.fuelAmount / info.fuelCapacity * 100)) or "  - "
                 local dev = "    -"
@@ -724,18 +766,24 @@ local function buildStatus()
                     note = "out of fuel (ME importer?)"
                 elseif mode == "power" then
                     note = "energy control"
+                elseif sp then
+                    dev = "stock"
+                    note = (sp.state == "filling") and "filling to cap"
+                        or (sp.state == "holding" and "stopped (fuel floor)" or sp.state)
                 elseif target <= 0 then
                     note = "idle (rate 0)"
                 end
                 if rod.capacity then note = note .. string.format(" max %.2f", rod.capacity) end
                 if rod.lastError then note = note .. " ERR " .. rod.lastError end
-                local text = string.format("%-7s %-10s %5s %s %4s %6.2f/%-6.2f %5s %s", shortId(id),
+                local targetText = (target >= InsanitePlanner.FULL_BURN) and "max   " or string.format("%-6.2f", target)
+                local text = string.format("%-7s %-10s %5s %s %4s %6.2f/%s %5s %s", shortId(id),
                     (cfg.resources[p.output].label or p.output):sub(1, 10),
-                    r and string.format("x%.2f", r.trim) or "", fuel,
+                    (r and not sp) and string.format("x%.2f", r.trim) or "", fuel,
                     rod.level and string.format("%3.0f%%", rod.level) or "  - ",
-                    rod.measured or 0, target, dev, note)
+                    rod.measured or 0, targetText, dev, note)
                 local color = colors.white
                 if rod.capacity or beyond then color = colors.orange end
+                if sp then color = colors.cyan end -- flat out by design; a recorded max is normal
                 if alerts["track:" .. id] or rod.lastError then color = colors.red end
                 add(text, color)
             end
@@ -842,7 +890,7 @@ function Factory.init(extraOverrides)
     end
     need, opsPerBlock = InsanitePlanner.computeNeeds(model)
 
-    machineState, reactorInfo, lastEject, craftableCache = {}, {}, {}, {}
+    machineState, reactorInfo, lastEject, craftableCache, stockState = {}, {}, {}, {}, {}
     lastNotes, lastActions, lastStock, lastProjected = {}, {}, {}, {}
     alerts, alertOrder, trackSince, deviation, slowSince = {}, {}, {}, { reactors = {} }, nil
     local saved = readTableFile(cfg.stateFile)
@@ -930,7 +978,7 @@ function Factory.cycle()
     local burnTarget = {}
     if _G.InsaniteRods and InsaniteRods.enabled() then
         burnTarget, rateDetail = InsanitePlanner.rateTargets(cfg, model, need, opsPerBlock, stock,
-            plantRate, InsaniteRods.capacities())
+            plantRate, InsaniteRods.capacities(), stockState)
         local fullPace = {}
         for id, r in pairs(rateDetail.reactors) do fullPace[id] = plantRate * r.share end
         InsaniteRods.update(burnTarget, reactors, fullPace)
