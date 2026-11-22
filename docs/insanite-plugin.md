@@ -65,11 +65,33 @@ always contains the chain in recipe ratio. The status screen shows each material
 Every 5 s, every product below target that has inputs available becomes a candidate. Candidates
 are sorted by coverage, lowest first, so:
 
-- The single reprocessor runs the recipe whose product is furthest behind.
+- The single reprocessor runs the recipe whose product is furthest behind, **full batches first**
+  (see below).
 - Other scarce shared inputs (blutonium feeds the reprocessor and the fluidizer; rossinite feeds
   two reprocessor recipes) go to whichever consumer's product is furthest behind.
 
-**Blutonium first for cyanite.** Machine recipes claim shared inputs before AE2 crafts, so
+**Full batches first.** A recipe whose ingredients only cover part of its batch, because one is
+trickling in, waits while recipes with a full batch ready run. That way it can't take the
+reprocessor for a 2-second job every cycle. A waiting priority recipe (blutonium) keeps holding
+what it has, so its batch fills up, and if nothing else is ready it loads what it has. Without
+this, cyanite arriving two ingots at a time gave blutonium the reprocessor every cycle for a
+one-operation job, and insanite, inanite and ludicrite never ran. (Your screen in that state:
+`waiting (reprocessor -> blutonium)` everywhere and a magentite pile-up.)
+
+**Blutonium on its own AE2-driven reprocessor** (`autocraft.blutonium = true`, the default in the
+repo's `insanite.conf`). Blutonium is 92 of the 156 reprocessor operations per block, so it gets
+a reprocessor of its own, driven by an AE2 processing pattern (2 cyanite → 1 blutonium, with
+water piped in separately; see the setup checklist). The
+plugin then requests blutonium from AE2 like the liquids, and the shared reprocessor keeps only
+ludicrite, ridiculite, inanite and insanite (64 operations per block). A one-recipe reprocessor
+can't mix, needs no batch logic and runs flat out (about 1,800 blutonium/h, roughly 19 blocks/h
+worth). With `autocraft.blutonium = false` the shared reprocessor makes blutonium as before. If
+the pattern is missing, the status says `craft blutonium no AE2 pattern`; the shared reprocessor
+doesn't fall back to it.
+
+**Blutonium first for cyanite.** Machine recipes claim shared inputs before AE2 crafts, and among
+AE2 crafts the blutonium craft claims them before liquid cyanite (shown as
+`needs cyanite (held for craft blutonium)`). So
 cyanite goes to the blutonium recipe before the liquid-cyanite craft. The blutonium recipe is also
 marked `priority = true` in `config.lua`. When it's the reprocessor's pick (furthest behind) or
 already running, it **holds its cyanite** (up to one full load, 10 ingots), even when there's only
@@ -187,15 +209,16 @@ Safety and fallbacks:
 - **Stale targets:** if the factory stops sending targets for `rodStaleSeconds` (bridge missing,
   plugin crashed), every reactor reverts to the core energy law.
 
-## AE2 craft requests (three, and only three)
+## AE2 craft requests (four, and only four)
 
 | Craft | Used for | Per Insanite Block |
 | --- | --- | --- |
+| `blutonium` | Everything blutonium feeds; made by your AE2-driven reprocessor (pattern: 2 cyanite → 1 blutonium; water piped in) | 92 (184 cyanite) |
 | `cyanite_fluid` | The ludicrite recipe; made by AE2 from cyanite ingots | 32 B (32 ingots) |
 | `magentite_fluid` | The ridiculite recipe; made by AE2 from magentite ingots | 16 B (16 ingots) |
 | `insanite_block` | The finished block, from the kit (see "Insanite Block autocraft" below) | 1 block |
 
-The first two keep ME stocked and follow the rules below.
+The first three keep ME stocked and follow the rules below.
 
 - **When:** a craft is requested when ME holds less than `stockBlocks` worth, AE2 has a pattern,
   and AE2 isn't already crafting it. The amount is the shortfall, at most `maxCraftItems` (64)
@@ -281,7 +304,7 @@ SCRAM or stop anything.
 | `R7 burning N% below its target … - out of fuel (check its ME importer)` | A reactor has been more than `deviationAlertPct` (15%) off its own burn target for `deviationAlertSeconds` (2 min). The reason is given where known: out of fuel, rods fully out, rods fully in. |
 | `REPROCESSOR stalled on …` / `port missing` / `unknown contents` | A batch machine can't run. |
 | `ME BRIDGE … NOT FOUND` | The factory is paused. |
-| `REPROCESSOR AT CAPACITY: work waited for it 95% of the last 5 min (ludicrite, blutonium). It's limiting throughput; another reprocessor would raise it.` (same for the fluidizer) | Ready work (a product below target with every ingredient in ME) waited for that machine in `machineAlertPct` (90%) of the cycles over the last `machineAlertSeconds` (5 min), because it was busy with another recipe or full. The machine is limiting throughput. Raised as **advisory** in SCADA, since it's a limit, not a fault. The machine's row on the status screen shows the same figure as `queue N%` (with `(warming up)` until 5 min of history exist). A machine with spare capacity stays well under: with R5 as the limit, the reprocessor peaks around 26%. It can show briefly right after a start, while the plant fills its buffers from low. The machines stop button resets the measurement. |
+| `REPROCESSOR AT CAPACITY: busy 92% of the last 5 min with work waiting (ludicrite, inanite). It's limiting throughput; another reprocessor would raise it.` (same for the fluidizer) | Over the last `machineAlertSeconds` (5 min) the machine was **actually working** at least `machineAlertPct` (75%) of the time, and ready work (a product below target with every ingredient in ME) waited for it in at least `machineBacklogPct` (50%) of the cycles. Working time is real work: each batch counts its operations × the time per operation (2 s for the reprocessor, from the mod; for the fluidizer, learned from how long its batches take), never past the moment it was seen finished. So a reprocessor doing one 2-second blutonium job per 5-second cycle reads about 40% and doesn't alert: it's starved, not saturated. Raised as **advisory** in SCADA, since it's a limit, not a fault. The machine's row on the status screen shows `busy N%` (with `(warming up)` until 5 min of history exist). It can show right after a start or a shortage, while the plant catches up at full pace. The machines stop button resets the measurement. |
 | `KIT FULL, but AE2 can't craft Insanite Blks: no AE2 pattern …` / `ME has no Netherite Blk` | The kit is at target, the Insanite Block autocraft is on, but AE2 can't make the block. The plant holds at `kit full` until it can. |
 
 An alert clears once its cause has been gone for `alertClearSeconds` (30 s). A slowdown alert stays
@@ -311,12 +334,24 @@ trim explains. If R6 isn't burning, the first burning reactor becomes the refere
 4. **AE2 patterns** for the crafts you enable: cyanite ingot → liquid cyanite, magentite
    ingot → liquid magentite, and for the block: Inanite Block (8 inanite + 1 netherite block) and
    Insanite Block (8 insanite + 1 Inanite Block), with molecular assemblers for the two.
-5. **Nothing else may feed** the reprocessor or fluidizer injectors. The reprocessor's single
+5. **The blutonium reprocessor** (`autocraft.blutonium = true`): a second Reprocessor that only
+   ever makes blutonium, kept off the plugin's wired network (the plugin never loads it):
+   - **Water on its own, always on:** pipe water into its Fluid Injector permanently (an infinite
+     water source, or an export bus with water). It only ever makes blutonium, so its tank can
+     simply stay full of water.
+   - A **processing pattern** with only the items: 2 cyanite ingots → 1 blutonium ingot. AE2
+     pushes all of a pattern's inputs into one block, so leaving the water out of the pattern
+     lets the provider face the Waste Injector directly. (The plugin still counts 1 B of water
+     per blutonium when planning, so its numbers stay right either way.)
+   - A **pattern provider** facing the Waste Injector. Leave blocking mode off: one recipe can't mix.
+   - The Reprocessor **Output Port** back into ME (import bus, or an interface it pushes into).
+   - Nothing else feeding it.
+6. **Nothing else may feed** the shared reprocessor or fluidizer injectors. The reprocessor's single
    fluid injector is shared by water, liquid cyanite, liquid magentite and rossinite, so water must
    come from ME too.
-6. **ME stock**: uranium ingots (over the 200,000 floor for R6 + R8 to run), water, benitoite
+7. **ME stock**: uranium ingots (over the 200,000 floor for R6 + R8 to run), water, benitoite
    crystals (mined), netherite blocks.
-7. **Power.** The four reactors no longer follow energy demand. They stop when the kit is full.
+8. **Power.** The four reactors no longer follow energy demand. They stop when the kit is full.
    If your base depends on one of them for power, set that reactor's `rodControl = "power"` (it
    then leaves the locked ratio).
 
@@ -345,7 +380,7 @@ The repo's `insanite.conf` is your current in-game setup:
 | `stockCaps` | `cyanite = 4096` | How much of each stock pool's waste to keep in ME (ingots, or mB for fluids) |
 | `stockFuelFloor` | `cyanite = 200000` | Each stock pool stops while ME holds less of its fuel than this (here uranium ingots) |
 | `stockMaxBurn` | not set | Optional burn ceiling per stock pool, mB/t for all its reactors |
-| `autocraft` | `cyanite_fluid`, `magentite_fluid`, `insanite_block` all `true` | Which of the three AE2 crafts may be requested |
+| `autocraft` | `blutonium`, `cyanite_fluid`, `magentite_fluid`, `insanite_block` all `true` | Which of the four AE2 crafts may be requested; `blutonium = false` puts blutonium back on the shared reprocessor |
 
 **Nothing may be left out.** `false` means "none" and has to be written explicitly. At boot the
 plugin checks the file against the devices actually on the network. If anything is wrong, it does
@@ -404,7 +439,7 @@ tuning key that isn't a setting (`Did you mean stockBlocks?`).
 | `slowAlertSeconds` | 600 | …but only after this long when no cause is found |
 | `alertClearSeconds` | 30 | Alert clears once its cause has been gone this long |
 | `scadaAlarms` | true | Also raise alerts in the core's alarm list (SCADA screen) |
-| `machineAlertPct` / `machineAlertSeconds` | 90 / 300 | A machine is "at capacity" when ready work waited for it this % of the time over this window |
+| `machineAlertPct` / `machineBacklogPct` / `machineAlertSeconds` | 75 / 50 / 300 | A machine is "at capacity" when it's actually working this % of the window and ready work waited for it in this % of the cycles |
 | `capacitySeconds` | 30 | Rods fully out this long and still short → reactor at its max |
 | `rodStaleSeconds` | 60 | Revert to the core energy law if targets stop arriving |
 | `crafts.<name>` | see file | What one AE2 craft consumes (`inputs`) and makes (`outQty`); match your pattern |
@@ -425,8 +460,8 @@ A 4×4 Advanced Monitor fits it (about 45 lines, 79 characters wide). It shows:
   pace with what's limiting it (`kit reserve`, `kit full`, `R5 max burn`, `overflow rossinite`…).
 - **Resources:** ME stock, per-block need and coverage. Green = at target, orange = short, red =
   a raw input under one block's worth.
-- **Machines:** batch machine state with its `queue N%` (how much of the last 5 min ready work
-  waited for it; orange at the at-capacity threshold), what each recipe is doing (`start x5`,
+- **Machines:** batch machine state with its `busy N%` (real work over the last 5 min; orange
+  when it's at capacity), what each recipe is doing (`start x5`,
   `needs water`, `waiting`, `at target`), and the `craft block` line (Insanite Block autocraft,
   blocks in ME).
 - **Reactors:** mode, trim, fuel %, rods %, burn vs target (mB/t), deviation from the reference
@@ -517,9 +552,19 @@ The test checks:
   at once (one with one netherite block, none without and an alert, none and an alert without the
   AE2 pattern, none while AE2 is crafting it or the machines button is on, never when off); from a
   full kit the plant refills and AE2 crafts again repeatedly, each time with the full kit
-- machine at capacity: ready recipes waiting for a running, taken or full machine are counted
-  (not for a stalled machine or with the machines button on); with R5 as the limit the reprocessor
-  never reaches the threshold after the first hour; a slow fluidizer raises `FLUIDIZER AT
+- full batches first: a recipe with only part of a batch waits while a full batch runs, keeps
+  holding its cyanite, and loads what it has when nothing else is ready
+- in-game situation (cyanite trickling in, R7's tank soaking up verderium, your reactor speeds):
+  insanite and inanite get turns and the kit grows; the reprocessor reads well under the
+  threshold and raises no at-capacity alert
+- AE2 blutonium reprocessor: the repo's config turns it on; AE2 takes over the blutonium recipe
+  and the shared reprocessor keeps the other four; ratios unchanged; one cyanite is held for the
+  blutonium craft, not turned into liquid; in a full run blutonium comes from AE2 and the shared
+  reprocessor never loads cyanite; a missing pattern is shown and not silently replaced; the config
+  check passes with it on or off, and off puts the recipe back on the shared reprocessor
+- machine at capacity: busy is real work (operations × time per operation); ready recipes waiting
+  for a running, taken or full machine are counted (not for a stalled machine or with the machines
+  button on); with R5 as the limit the reprocessor never reaches the threshold after the first hour; a slow fluidizer raises `FLUIDIZER AT
   CAPACITY` (advisory in SCADA) and shows its queue; the machines button clears it and restarts
   the measurement; reactors pushed past one reprocessor give an overflow slowdown naming
   `reprocessor at capacity`; the full-plant run (reprocessor-limited by design) names the

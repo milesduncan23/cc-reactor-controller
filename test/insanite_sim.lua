@@ -29,9 +29,13 @@ local function check(cond, msg)
     end
 end
 
--- The plant config shipped in the repo (= what /insanite.conf holds in game). D = defaults merged
--- with it, i.e. the effective config.
-local PLANT_TEXT = io.open("insanite.conf"):read("a")
+-- The plant config shipped in the repo (= what /insanite.conf holds in game).
+local TEMPLATE_TEXT = io.open("insanite.conf"):read("a")
+local TEMPLATE = assert(load("return " .. TEMPLATE_TEXT, "=insanite.conf", "t", {}))()
+-- Most tests describe the shared reprocessor making blutonium itself (autocraft.blutonium =
+-- false); the AE2-driven blutonium reprocessor has its own section. D = defaults merged with that
+-- plant, i.e. the effective config.
+local PLANT_TEXT = (TEMPLATE_TEXT:gsub("blutonium = true,", "blutonium = false,", 1))
 local PLANT = assert(load("return " .. PLANT_TEXT, "=insanite.conf", "t", {}))()
 local D = InsaniteFactory.deepMerge(InsaniteFactory.deepMerge(INSANITE_DEFAULTS, {}), PLANT)
 local function writePlant(text)
@@ -126,7 +130,8 @@ end
 
 --region fake world
 
-local ALLOWED = { [id("cyanite_fluid")] = "fluid", [id("magentite_fluid")] = "fluid", [id("insanite_block")] = "item" }
+local ALLOWED = { [id("cyanite_fluid")] = "fluid", [id("magentite_fluid")] = "fluid", [id("insanite_block")] = "item",
+    [id("blutonium")] = "item" }
 
 local function newWorld(opts)
     opts = opts or {}
@@ -248,6 +253,13 @@ local function newWorld(opts)
                 return nil, "MISSING_ITEMS"
             end
             add("item", i, -8 * amount); add("item", a, -8 * amount); add("item", n, -amount)
+        end
+        if gid == id("blutonium") then
+            -- the AE2-driven reprocessor: 2 cyanite + 1000 mB water per blutonium
+            if (me.item[id("cyanite")] or 0) < 2 * amount or (me.fluid[id("water")] or 0) < 1000 * amount then
+                return nil, "MISSING_ITEMS"
+            end
+            add("item", id("cyanite"), -2 * amount); add("fluid", id("water"), -1000 * amount)
         end
         if gid == id("cyanite_fluid") or gid == id("magentite_fluid") then
             local ingot = (gid == id("cyanite_fluid")) and id("cyanite") or id("magentite")
@@ -1224,6 +1236,153 @@ end
 
 --endregion
 
+--region 8d. full batches first + the AE2 blutonium reprocessor
+
+print("full batches first: a recipe with only part of a batch waits while full batches run")
+do
+    local model = InsanitePlanner.buildModel(D)
+    local need = InsanitePlanner.computeNeeds(model)
+    local function planned(over)
+        local stock = {}
+        for res in pairs(model.resources) do stock[res] = 0 end
+        stock.water, stock.uranium = 1e9, 1e6
+        for k, v in pairs(over) do stock[k] = v end
+        local actions, notes = InsanitePlanner.plan(D, model, need, { stock = stock, pending = {}, busy = {}, running = {},
+            crafting = {}, craftable = {} })
+        local by = {}
+        for _, a in ipairs(actions) do by[a.process.id] = a.ops end
+        return by, notes
+    end
+    -- blutonium is furthest behind but has cyanite for 1 of its 5; insanite has a full batch ready
+    local by, notes = planned({ cyanite = 2, benitoite = 1000, rossinite = 100000, insanite = 4 })
+    check(by.insanite and by.blutonium == nil, "insanite's full batch goes first (" .. tostring(notes.blutonium) .. ")")
+    check(by["craft cyanite_fluid"] == nil, "the waiting blutonium still holds its cyanite from the liquid-cyanite craft")
+    by = planned({ cyanite = 2 })
+    check(by.blutonium == 1, "nothing else ready: blutonium loads what it has")
+end
+
+print("in-game situation: cyanite trickling in, R7's tank soaking up verderium, your reactor speeds")
+do
+    _G.__simClock = 0
+    local W = newWorld({ maxBurn = { [R5] = 0.7, [R6] = 1.26, [R8] = 1.26 } })
+    stockUp(W)
+    local start = { insanite = 3, inanite = 2, ridiculite = 22, ludicrite = 1, blutonium = 0, verderium = 0,
+        cyanite_fluid = 64000, magentite_fluid = 67500, cyanite = 0, magentite = 105, rossinite = 34900, benitoite = 1004 }
+    for res, v in pairs(start) do W.me[D.resources[res].kind][id(res)] = v end
+    local jobs = {}
+    local recipeOf = { [id("cyanite")] = "blutonium", [id("blutonium")] = "ludicrite", [id("ludicrite")] = "ridiculite",
+        [id("ridiculite")] = "inanite", [id("benitoite")] = "insanite" }
+    local bridge = peripheral._registry[D.bridge].methods
+    local real = bridge.exportItem
+    bridge.exportItem = function(t, f)
+        local n = real(t, f)
+        if t == D.machines.reprocessor.ports.solid and (tonumber(n) or 0) > 0 then
+            local r = recipeOf[f.name]
+            jobs[r] = (jobs[r] or 0) + 1
+        end
+        return n
+    end
+    local falseAlarm = false
+    W.t = 0
+    writePlant(PLANT_TEXT)
+    InsaniteFactory.init()
+    for _ = 1, 30 * 60 do
+        W.t = W.t + 1; _G.__simClock = _G.__simClock + 1
+        W.step()
+        W.me.fluid[id("verderium")] = 0 -- R7's importer takes every drop while its tank fills
+        if W.t % D.cycleSeconds == 0 then
+            W.me.item[id("cyanite")] = (W.me.item[id("cyanite")] or 0) + 2 -- ~2 cyanite per cycle
+            InsaniteFactory.cycle()
+            for _, a in ipairs(InsaniteFactory.alerts()) do if a.key:find("^atcapacity") then falseAlarm = true end end
+        end
+    end
+    check((jobs.insanite or 0) >= 1 and (jobs.inanite or 0) >= 1, string.format(
+        "insanite and inanite get turns (jobs: blutonium %d, insanite %d, inanite %d)", jobs.blutonium or 0,
+        jobs.insanite or 0, jobs.inanite or 0))
+    check(amount(W, "insanite") + amount(W, "inanite") >= 5 + 8, string.format("kit grew: insanite %d, inanite %d (from 3, 2)",
+        amount(W, "insanite"), amount(W, "inanite")))
+    local busy
+    for _, l in ipairs(InsaniteFactory.statusLines()) do busy = busy or l.text:match("^reprocessor.-busy (%d+)%%") end
+    check(not falseAlarm and tonumber(busy or 100) < D.machineAlertPct,
+        "no at-capacity alert: the reprocessor is busy only " .. tostring(busy) .. "% (it's starved, not saturated)")
+end
+
+print("AE2 blutonium reprocessor (autocraft.blutonium = true, as in the repo's insanite.conf)")
+do
+    local DA = InsaniteFactory.deepMerge(InsaniteFactory.deepMerge(INSANITE_DEFAULTS, {}), TEMPLATE)
+    check(DA.autocraft.blutonium == true, "the repo's insanite.conf turns it on")
+    local model = InsanitePlanner.buildModel(DA)
+    local need, ops = InsanitePlanner.computeNeeds(model)
+    check(model.byId["craft blutonium"] ~= nil and model.byId.blutonium == nil
+        and model.producerOf.blutonium.id == "craft blutonium", "AE2 takes over the blutonium recipe; the shared reprocessor drops it")
+    check(need.blutonium == 92 and need.cyanite == 216 and math.abs(ops["craft blutonium"] - 92) < 1e-9,
+        "ratios unchanged: 92 blutonium, 216 cyanite per block")
+    local shared = {}
+    for _, p in ipairs(model.processes) do if p.machine == "reprocessor" then shared[#shared + 1] = p.id end end
+    table.sort(shared)
+    check(table.concat(shared, ",") == "inanite,insanite,ludicrite,ridiculite", "shared reprocessor: " .. table.concat(shared, ", "))
+
+    local function planned(over)
+        local stock = {}
+        for res in pairs(model.resources) do stock[res] = 0 end
+        stock.water = 1e9
+        for k, v in pairs(over) do stock[k] = v end
+        local actions, notes = InsanitePlanner.plan(DA, model, need, { stock = stock, pending = {}, busy = {}, running = {},
+            crafting = {}, craftable = {} })
+        local by = {}
+        for _, a in ipairs(actions) do by[a.process.id] = a.ops end
+        return by, notes
+    end
+    local by, notes = planned({ cyanite = 1 })
+    check(by["craft blutonium"] == nil and by["craft cyanite_fluid"] == nil
+        and notes["craft cyanite_fluid"] == "needs cyanite (held for craft blutonium)",
+        "1 cyanite: held for blutonium, not turned into liquid cyanite (" .. tostring(notes["craft cyanite_fluid"]) .. ")")
+    by = planned({ cyanite = 20 })
+    check(by["craft blutonium"] == 10 and by["craft cyanite_fluid"] == nil, "20 cyanite: all of it to blutonium first")
+
+    -- A full run: AE2 makes the blutonium, the shared reprocessor never sees cyanite.
+    _G.__simClock = 0
+    local W = newWorld()
+    stockUp(W)
+    W.me.item[id("netherite_block")] = 100
+    local cyaniteIntoReprocessor = 0
+    local bridge = peripheral._registry[D.bridge].methods
+    local real = bridge.exportItem
+    bridge.exportItem = function(t, f)
+        local n = real(t, f)
+        if t == D.machines.reprocessor.ports.solid and f.name == id("cyanite") then cyaniteIntoReprocessor = cyaniteIntoReprocessor + (n or 0) end
+        return n
+    end
+    runWorld(W, 2 * 3600, nil, { plantText = TEMPLATE_TEXT })
+    check((W.stats.craftRequests[id("blutonium")] or 0) > 0, string.format("blutonium requested from AE2 (%d in 2 h)",
+        W.stats.craftRequests[id("blutonium")] or 0))
+    check(cyaniteIntoReprocessor == 0, "the shared reprocessor never loads cyanite")
+    check(amount(W, "insanite_block") >= 2 and W.stats.badCrafts == 0 and W.stats.craftDuplicates == 0,
+        amount(W, "insanite_block") .. " Insanite Blocks made; nothing disallowed or doubled")
+    check(W.stats.mixed == 0 and W.stats.stuck == 0, "no mixing or stuck batches")
+
+    -- Pattern missing: the shared reprocessor does NOT fall back to making it.
+    _G.__simClock = 0
+    W = newWorld({ noPatterns = { [id("blutonium")] = true } })
+    stockUp(W)
+    W.me.item[id("blutonium")] = 0
+    runWorld(W, 120, nil, { plantText = TEMPLATE_TEXT })
+    check(InsaniteFactory.lastNotes()["craft blutonium"] == "no AE2 pattern",
+        "no pattern: status says so (" .. tostring(InsaniteFactory.lastNotes()["craft blutonium"]) .. ")")
+
+    -- Switched off: the shared reprocessor makes it again, and the config check is happy either way.
+    local off = copy(TEMPLATE)
+    off.autocraft.blutonium = false
+    local NETWORK = nil
+    local e = InsanitePlanner.validatePlant(off, INSANITE_DEFAULTS, NETWORK)
+    local e2 = InsanitePlanner.validatePlant(TEMPLATE, INSANITE_DEFAULTS, NETWORK)
+    check(#e == 0 and #e2 == 0, "config check passes with blutonium on AE2 and with it off (" .. tostring(e[1] or e2[1]) .. ")")
+    local DOff = InsaniteFactory.deepMerge(InsaniteFactory.deepMerge(INSANITE_DEFAULTS, {}), off)
+    check(InsanitePlanner.buildModel(DOff).byId.blutonium ~= nil, "autocraft.blutonium = false: the reprocessor recipe is back")
+end
+
+--endregion
+
 --region 9. ratio deviation + alerts
 
 print("ratio deviation vs the reference reactor (ratio mode)")
@@ -1287,8 +1446,13 @@ do
 
     W.me.item[id("benitoite")] = 10000
     runWorld(W, 3 * 3600, nil, { continue = true })
-    check(next(alertKeys()) == nil, "all alerts cleared after benitoite arrives")
-    check(next(scada) == nil, "and cleared from the core alarm list")
+    -- Fault alerts clear. (This simulated plant then runs at full pace, where its one reprocessor
+    -- is the bottleneck, so the advisory at-capacity notice may be up; that's not a fault.)
+    local left, leftScada = {}, {}
+    for k, v in pairs(alertKeys()) do if not k:find("^atcapacity:") then left[#left + 1] = k .. ": " .. v end end
+    for k in pairs(scada) do if not k:find("^insanite:atcapacity:") then leftScada[#leftScada + 1] = k end end
+    check(#left == 0, "all fault alerts cleared after benitoite arrives (" .. table.concat(left, " | ") .. ")")
+    check(#leftScada == 0, "and cleared from the core alarm list (" .. table.concat(leftScada, ", ") .. ")")
     check(W.stats.mixed == 0 and W.stats.stuck == 0, "no mixing or stuck batches throughout")
 end
 
@@ -1450,13 +1614,13 @@ do
         if t > 3600 then
             for _, a in ipairs(InsaniteFactory.alerts()) do if a.key:find("^atcapacity") then up = up + 1 end end
             for _, l in ipairs(InsaniteFactory.statusLines()) do
-                local q = l.text:match("^reprocessor.-queue (%d+)%%")
+                local q = l.text:match("^reprocessor.-busy (%d+)%%")
                 if q then maxQ = math.max(maxQ, tonumber(q)) end
             end
         end
     end })
-    check(up == 0 and maxQ < D.machineAlertPct, string.format(
-        "R5-limited plant: no at-capacity alert after the first hour (reprocessor queue peaked at %d%%)", maxQ))
+    check(up == 0 and maxQ > 0 and maxQ < D.machineAlertPct, string.format(
+        "R5-limited plant: no at-capacity alert after the first hour (reprocessor busy at most %d%%)", maxQ))
 
     -- A slow fluidizer (40 s per operation): it limits verderium, and says so.
     _G.__simClock = 0
@@ -1475,7 +1639,7 @@ do
     check(severity["insanite:atcapacity:fluidizer"] == "advisory", "raised in SCADA as advisory (a limit, not a fault)")
     local row
     for _, l in ipairs(InsaniteFactory.statusLines()) do if l.text:find("^fluidizer") then row = l.text end end
-    check(row and row:find("queue %d+%%"), "fluidizer row shows its queue: " .. tostring(row))
+    check(row and row:find("busy %d+%%"), "fluidizer row shows how busy it is: " .. tostring(row))
 
     -- Machines stop button: the measurement restarts and the alert clears.
     InsaniteFactory.setStopped("machines", true)
@@ -1523,7 +1687,7 @@ do
         [R7] = { "BigReactors-Reactor" }, [R8] = { "BigReactors-Reactor" },
     }
     local function check_(mutate)
-        local plant = copy(PLANT)
+        local plant = copy(TEMPLATE)
         mutate(plant)
         return InsanitePlanner.validatePlant(plant, INSANITE_DEFAULTS, NET)
     end
@@ -1539,7 +1703,7 @@ do
     end
     local function show(list) return (list[1] or "(none)"):gsub("\n%s*", " | ") end
 
-    local e, w = InsanitePlanner.validatePlant(PLANT, INSANITE_DEFAULTS, NET)
+    local e, w = InsanitePlanner.validatePlant(TEMPLATE, INSANITE_DEFAULTS, NET)
     check(#e == 0 and #w == 0, "repo insanite.conf matches the in-game network: no problems (" .. show(e) .. show(w) .. ")")
 
     -- What changed in this round
@@ -1553,10 +1717,10 @@ do
         "missing autocraft section -> ready-to-paste block: " .. show(e))
 
     e = check_(function(p) p.autocraft.insanite = true end)
-    check(has(e, "autocraft.insanite", "may only ask AE2 to craft cyanite_fluid, insanite_block, magentite_fluid."),
+    check(has(e, "autocraft.insanite", "may only ask AE2 to craft blutonium, cyanite_fluid, insanite_block, magentite_fluid."),
         "crafting anything else is refused: " .. show(e))
     e = check_(function(p) p.autocraft.yellorium = true end)
-    check(has(e, "autocraft.yellorium", "may only ask AE2 to craft cyanite_fluid, insanite_block, magentite_fluid.", "Remove that line"),
+    check(has(e, "autocraft.yellorium", "may only ask AE2 to craft blutonium, cyanite_fluid, insanite_block, magentite_fluid.", "Remove that line"),
         "a leftover yellorium autocraft line is refused: " .. show(e))
 
     e = check_(function(p) p.autocraft.magentite_fluid = nil end)
@@ -1671,12 +1835,12 @@ do
     local plant, errs = InsaniteFactory.checkPlant()
     check(plant == nil and has(errs, "/insanite.conf not found", "install-insanite.lua"), "missing file: " .. show(errs))
 
-    writePlant(PLANT_TEXT:gsub('bridge = "me_bridge_2",', 'bridge = "me_bridge_2"', 1))
+    writePlant(TEMPLATE_TEXT:gsub('bridge = "me_bridge_2",', 'bridge = "me_bridge_2"', 1))
     plant, errs = InsaniteFactory.checkPlant()
     check(plant == nil and has(errs, "syntax error", "/insanite.conf:", "missing comma"), "syntax error with line number: " .. show(errs))
 
     -- The plugin refuses to start and writes the full list where the player can read it.
-    writePlant((PLANT_TEXT:gsub('monitor = "' .. D.monitor .. '",', '', 1)))
+    writePlant((TEMPLATE_TEXT:gsub('monitor = "' .. D.monitor .. '",', '', 1)))
     local ok, problem = pcall(InsaniteFactory.init)
     check(not ok and type(problem) == "table" and has(problem.plantErrors, "monitor is missing"), "init refuses to start on a bad config")
     local saved = print

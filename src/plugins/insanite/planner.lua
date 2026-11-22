@@ -33,8 +33,20 @@ local HUGE = math.huge
 
 -- The only things the plugin may ever ask AE2 to craft. Anything else is refused here and in
 -- the factory, whatever the config says. insanite_block is the finished block (cfg.blockCraft);
--- the other two keep ME stocked.
-Planner.ALLOWED_CRAFTS = { cyanite_fluid = true, magentite_fluid = true, insanite_block = true }
+-- the others keep ME stocked. blutonium is made by an AE2-driven reprocessor of its own: when it's
+-- on, it takes over the shared reprocessor's blutonium recipe.
+Planner.ALLOWED_CRAFTS = { cyanite_fluid = true, magentite_fluid = true, insanite_block = true, blutonium = true }
+
+-- AE2 crafts switched on in the plant config (allowed, autocraft.<res> = true, not the block).
+local function enabledCrafts(cfg)
+    local on = {}
+    for res in pairs(cfg.crafts or {}) do
+        if Planner.ALLOWED_CRAFTS[res] and (cfg.autocraft or {})[res] == true and res ~= cfg.blockCraft then
+            on[res] = true
+        end
+    end
+    return on
+end
 
 local function clamp(value, lo, hi)
     if value < lo then return lo end
@@ -102,25 +114,29 @@ function Planner.buildModel(cfg)
         end
     end
 
+    local crafted = enabledCrafts(cfg)
     local order = 0
     for _, src in ipairs(cfg.processes or {}) do
-        local p = {}
-        for k, v in pairs(src) do p[k] = v end
         order = order + 1
-        p.order = order
-        p.outQty = p.outQty or 1
-        add(p)
+        -- An enabled AE2 craft for the same product takes this batch recipe over.
+        if not crafted[src.output] then
+            local p = {}
+            for k, v in pairs(src) do p[k] = v end
+            p.order = order
+            p.outQty = p.outQty or 1
+            add(p)
+        end
     end
 
     -- AE2 crafts: only allowed ones, only when enabled in the plant config.
     for _, res in ipairs(sortedKeys(cfg.crafts)) do
         local c = cfg.crafts[res]
-        if Planner.ALLOWED_CRAFTS[res] and (cfg.autocraft or {})[res] == true and res ~= cfg.blockCraft then
+        if crafted[res] then
             order = order + 1
             local inputs = {}
             for _, inp in ipairs(c.inputs or {}) do inputs[#inputs + 1] = { res = inp.res, qty = inp.qty } end
             add({ id = "craft " .. res, machine = "ae2", output = res, outQty = c.outQty or 1,
-                inputs = inputs, order = order })
+                inputs = inputs, order = order, priority = c.priority })
         end
     end
 
@@ -378,64 +394,97 @@ function Planner.plan(cfg, model, need, snap)
     table.sort(candidates, function(a, b)
         local am, bm = a.p.machine ~= "ae2", b.p.machine ~= "ae2"
         if am ~= bm then return am end -- machine recipes claim shared inputs before AE2 crafts
+        if not am then
+            -- AE2 crafts run side by side, so this only decides who gets a scarce input first:
+            -- a priority craft (blutonium) before the others (liquid cyanite).
+            local ap, bp = a.p.priority == true, b.p.priority == true
+            if ap ~= bp then return ap end
+        end
         if a.cov ~= b.cov then return a.cov < b.cov end
         return a.p.order < b.p.order
     end)
 
     -- Held inputs are out of reach for everything planned after the recipe holding them.
-    local heldFor = {}
+    local heldFor, heldBy = {}, {} -- res -> holding recipe; recipe -> { res = amount }
     local function hold(p, ops)
         for _, inp in ipairs(p.inputs) do
             local k = math.min(avail[inp.res] or 0, ops * inp.qty)
             if k > 0 then
                 avail[inp.res] = avail[inp.res] - k
                 heldFor[inp.res] = heldFor[inp.res] or p.id
+                heldBy[p.id] = heldBy[p.id] or {}
+                heldBy[p.id][inp.res] = (heldBy[p.id][inp.res] or 0) + k
             end
         end
     end
+    local function release(p)
+        for res, k in pairs(heldBy[p.id] or {}) do
+            avail[res] = (avail[res] or 0) + k
+            if heldFor[res] == p.id then heldFor[res] = nil end
+        end
+        heldBy[p.id] = nil
+    end
+    local function readyFor(p) -- counting what it holds itself
+        for _, inp in ipairs(p.inputs) do
+            if (avail[inp.res] or 0) + ((heldBy[p.id] or {})[inp.res] or 0) < inp.qty then return false end
+        end
+        return true
+    end
     for _, h in ipairs(holds) do hold(h.p, h.ops) end
 
-    local actions, taken = {}, {}
-    for _, c in ipairs(candidates) do
+    -- Full batches first: a machine recipe whose inputs only cover part of its batch (an input
+    -- trickling in) waits for a second pass, so it can't take the machine for a tiny job every
+    -- cycle while other recipes have a full batch ready. A waiting priority recipe keeps holding
+    -- its inputs, so its batch fills up; with nothing else ready it loads what it has.
+    local actions, taken, deferred = {}, {}, {}
+    local function consider(c, secondPass)
         local p = c.p
         local exclusive = p.machine ~= "ae2"
         if exclusive and taken[p.machine] then
             notes[p.id] = "waiting (" .. p.machine .. " -> " .. taken[p.machine] .. ")"
-            if readyIn(avail, p) then addWaiting(p.machine, p.id) end
-        else
-            local full = math.min(c.wanted, c.cap)
-            local short, shortOps = nil, HUGE
-            for _, inp in ipairs(p.inputs) do
-                local canDo = math.floor((avail[inp.res] or 0) / inp.qty)
-                if canDo < shortOps then short, shortOps = inp.res, canDo end
-            end
-            local ops = math.min(full, shortOps)
-            if ops >= 1 then
-                for _, inp in ipairs(p.inputs) do
-                    avail[inp.res] = avail[inp.res] - ops * inp.qty
-                end
-                if exclusive then
-                    taken[p.machine] = p.id
-                    -- Loaded to the machine's limit with more wanted and ME holding more: full.
-                    if ops == c.cap and c.wanted > c.cap and shortOps > c.cap then addWaiting(p.machine, p.id) end
-                end
-                actions[#actions + 1] = { process = p, ops = ops }
-                if p.machine == "ae2" then
-                    local def = model.resources[p.output]
-                    local amount = ops * p.outQty
-                    notes[p.id] = "request " .. ((def.kind == "fluid") and string.format("%.1fB", amount / 1000) or tostring(amount))
-                else
-                    notes[p.id] = "start x" .. ops
-                end
-            elseif heldFor[short] and heldFor[short] ~= p.id then
-                notes[p.id] = "needs " .. tostring(short) .. " (held for " .. heldFor[short] .. ")"
-            else
-                notes[p.id] = "needs " .. tostring(short)
-            end
-            -- A priority recipe holds what it would still load, even short of one operation.
-            if p.priority then hold(p, full - math.max(ops, 0)) end
+            if readyFor(p) then addWaiting(p.machine, p.id) end
+            return
         end
+        if secondPass then release(p) end
+        local full = math.min(c.wanted, c.cap)
+        local short, shortOps = nil, HUGE
+        for _, inp in ipairs(p.inputs) do
+            local canDo = math.floor((avail[inp.res] or 0) / inp.qty)
+            if canDo < shortOps then short, shortOps = inp.res, canDo end
+        end
+        if exclusive and not secondPass and shortOps >= 1 and shortOps < full then
+            deferred[#deferred + 1] = c
+            if p.priority then hold(p, full) end
+            return
+        end
+        local ops = math.min(full, shortOps)
+        if ops >= 1 then
+            for _, inp in ipairs(p.inputs) do
+                avail[inp.res] = avail[inp.res] - ops * inp.qty
+            end
+            if exclusive then
+                taken[p.machine] = p.id
+                -- Loaded to the machine's limit with more wanted and ME holding more: full.
+                if ops == c.cap and c.wanted > c.cap and shortOps > c.cap then addWaiting(p.machine, p.id) end
+            end
+            actions[#actions + 1] = { process = p, ops = ops }
+            if p.machine == "ae2" then
+                local def = model.resources[p.output]
+                local amount = ops * p.outQty
+                notes[p.id] = "request " .. ((def.kind == "fluid") and string.format("%.1fB", amount / 1000) or tostring(amount))
+            else
+                notes[p.id] = "start x" .. ops
+            end
+        elseif heldFor[short] and heldFor[short] ~= p.id then
+            notes[p.id] = "needs " .. tostring(short) .. " (held for " .. heldFor[short] .. ")"
+        else
+            notes[p.id] = "needs " .. tostring(short)
+        end
+        -- A priority recipe holds what it would still load, even short of one operation.
+        if p.priority then hold(p, full - math.max(ops, 0)) end
     end
+    for _, c in ipairs(candidates) do consider(c, false) end
+    for _, c in ipairs(deferred) do consider(c, true) end
 
     return actions, notes, projected, waiting
 end
@@ -1270,8 +1319,12 @@ function Planner.validatePlant(plant, defaults, network)
         for _, res in ipairs(craftNames) do
             local v = plant.autocraft[res]
             if v == nil then
+                local otherwise = "never"
+                for _, p in ipairs(defaults.processes or {}) do
+                    if p.output == res then otherwise = "the " .. p.machine .. " makes it instead" end
+                end
                 err("autocraft." .. res .. " is missing: true lets the plugin ask AE2 for " .. craftLine(res)
-                    .. " (" .. patternNeed(res) .. "); false = never.",
+                    .. " (" .. patternNeed(res) .. "); false = " .. otherwise .. ".",
                     "Add inside autocraft:   " .. res .. " = true,")
             elseif type(v) ~= "boolean" then
                 err("autocraft." .. res .. " must be true or false, but it is " .. describe(v) .. ".")
@@ -1284,9 +1337,13 @@ function Planner.validatePlant(plant, defaults, network)
     -- Sources: nothing may come from two places, and everything the recipes use should come
     -- from somewhere (a reactor, an enabled AE2 craft, or a batch recipe).
     local madeBy = {} -- res -> list of human-readable sources
+    -- An enabled AE2 craft takes over the batch recipe for the same product.
+    local function replaced(p) return craftOn[p.output] == true end
     for _, p in ipairs(defaults.processes or {}) do
-        madeBy[p.output] = madeBy[p.output] or {}
-        table.insert(madeBy[p.output], "the " .. p.id .. " recipe")
+        if not replaced(p) then
+            madeBy[p.output] = madeBy[p.output] or {}
+            table.insert(madeBy[p.output], "the " .. p.id .. " recipe")
+        end
     end
     for _, waste in ipairs(keysOf(producers)) do
         local names = {}
@@ -1313,9 +1370,11 @@ function Planner.validatePlant(plant, defaults, network)
     end
     local usedBy = {} -- res -> consumers (recipes and enabled crafts)
     for _, p in ipairs(defaults.processes or {}) do
-        for _, inp in ipairs(p.inputs or {}) do
-            usedBy[inp.res] = usedBy[inp.res] or {}
-            table.insert(usedBy[inp.res], "the " .. p.id .. " recipe")
+        if not replaced(p) then
+            for _, inp in ipairs(p.inputs or {}) do
+                usedBy[inp.res] = usedBy[inp.res] or {}
+                table.insert(usedBy[inp.res], "the " .. p.id .. " recipe")
+            end
         end
     end
     for _, res in ipairs(craftNames) do

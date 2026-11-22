@@ -77,6 +77,12 @@ _G.INSANITE_DEFAULTS = {
     crafts = {
         cyanite_fluid   = { outQty = 1000, inputs = { { res = "cyanite", qty = 1 } } },    -- 1 cyanite ingot -> 1000 mB
         magentite_fluid = { outQty = 1000, inputs = { { res = "magentite", qty = 1 } } },  -- 1 magentite ingot -> 1000 mB
+        -- A reprocessor of its own, driven by an AE2 processing pattern (2 cyanite -> 1 blutonium;
+        -- its water is piped in separately, but counted here so the plan stays right). When on,
+        -- it takes over the shared reprocessor's blutonium recipe.
+        -- priority: it claims cyanite before the liquid-cyanite craft.
+        blutonium       = { outQty = 1, priority = true,
+                            inputs = { { res = "cyanite", qty = 2 }, { res = "water", qty = 1000 } } },
     },
     maxCraftItems = 64,       -- most ingots per AE2 request
     maxCraftFluid = 16000,    -- most mB per AE2 request
@@ -87,15 +93,17 @@ _G.INSANITE_DEFAULTS = {
     --   * a reactor off its own burn target by more than deviationAlertPct for
     --     deviationAlertSeconds (out of fuel, stuck rods, ...)
     --   * a batch machine stalled, holding unknown items, or with a missing port
-    --   * a batch machine at capacity: ready work waited for it in machineAlertPct of the cycles
-    --     over the last machineAlertSeconds (it is limiting throughput; advisory in SCADA)
+    --   * a batch machine at capacity: actually working machineAlertPct of the last
+    --     machineAlertSeconds (loaded operations x time per operation) with ready work waiting in
+    --     machineBacklogPct of the cycles (it is limiting throughput; advisory in SCADA)
     -- The reactor table shows each reactor's % deviation from the plant config's referenceReactor.
     deviationAlertPct = 15,
     deviationAlertSeconds = 120,
     slowAlertPct = 25,        -- alert when the plant runs this much slower than the reserve asks
                               -- (a healthy plant dips at most ~20% from normal buffer swings)
     slowAlertSeconds = 600,   -- overflow slowdowns with no identified cause must last this long
-    machineAlertPct = 90,     -- a machine is "at capacity" when work waited for it this % of the time
+    machineAlertPct = 75,     -- a machine is "at capacity" when it's working this % of the time
+    machineBacklogPct = 50,   -- ... and ready work waited for it in this % of the cycles
     machineAlertSeconds = 300,-- ... over this window
     alertClearSeconds = 30,   -- an alert clears once its cause has been gone this long
     scadaAlarms = true,

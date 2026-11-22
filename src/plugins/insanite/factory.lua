@@ -33,6 +33,8 @@ local lastNotes, lastActions = {}, {}
 local lastStock, lastProjected = {}, {}
 local blocksInMe = nil       -- finished blocks (cfg.blockCraft) in ME, for the status screen
 local machineLoad = {}       -- machineName -> recent samples { t, limited, waiting = { processId... } }
+local machineRuns = {}       -- machineName -> recent batches { t0, ops, tEnd }
+local opSecondsLearned = {}  -- machineName -> seconds per operation, measured (when the mod's isn't known)
 local events = {}
 local cycleCount = 0
 local lastError = nil
@@ -248,6 +250,34 @@ end
 
 --region machines
 
+-- Seconds per operation: the mod's constant (opsPerTick) when known, else learned from how long
+-- this machine's batches took (the shortest per-operation time seen; finishing is only noticed at
+-- the next cycle, so longer readings are mostly that delay).
+local function opSeconds(name)
+    local m = (cfg.machines or {})[name]
+    if m and m.opsPerTick and m.opsPerTick > 0 then return 1 / m.opsPerTick / 20 end
+    return opSecondsLearned[name]
+end
+
+local function runStarted(name, ops)
+    local runs = machineRuns[name] or {}
+    machineRuns[name] = runs
+    runs[#runs + 1] = { t0 = now(), ops = ops }
+end
+
+local function runFinished(name)
+    local runs = machineRuns[name]
+    local r = runs and runs[#runs]
+    if not r or r.tEnd then return end
+    r.tEnd = now()
+    if r.ops > 0 and not ((cfg.machines or {})[name] or {}).opsPerTick then
+        local per = (r.tEnd - r.t0) / r.ops
+        if per > 0 and (opSecondsLearned[name] == nil or per < opSecondsLearned[name]) then
+            opSecondsLearned[name] = per
+        end
+    end
+end
+
 local function processesFor(machineName)
     local list = {}
     for _, p in ipairs(model.processes) do
@@ -332,7 +362,10 @@ local function observeMachine(name, m)
     sig = table.concat(sig, ",")
 
     if total == 0 then
-        if st.process then event("%s finished %s", name, st.process) end
+        if st.process then
+            event("%s finished %s", name, st.process)
+            runFinished(name)
+        end
         st.process, st.ops, st.busy, st.stalled, st.foreign, st.sig = nil, nil, false, false, nil, ""
         return st
     end
@@ -429,6 +462,7 @@ local function runBatch(p, ops)
     st.process, st.ops, st.busy, st.stalled = p.id, implied, true, false
     st.sig, st.changedAt = nil, now()
     event("%s <- %s x%d", p.machine, p.id, implied)
+    runStarted(p.machine, implied)
     return implied
 end
 
@@ -591,8 +625,27 @@ local function sampleMachines(waiting)
     end
 end
 
--- How much of the window work waited for this machine: pct (0-100), whether the samples cover
--- (nearly) the whole window yet, and the recipes that waited most often.
+-- Seconds of real work in the last `window` seconds: each batch counts its operations x the time
+-- per operation, and never past the moment it was seen finished.
+local function busySeconds(name, window)
+    local t = now()
+    local from = t - window
+    local per = opSeconds(name)
+    local runs = machineRuns[name] or {}
+    while #runs > 0 and (runs[1].tEnd or t) < from do table.remove(runs, 1) end
+    local total = 0
+    for _, r in ipairs(runs) do
+        local stop = r.tEnd or t
+        if per then stop = math.min(stop, r.t0 + r.ops * per) end
+        local a = math.max(r.t0, from)
+        if stop > a then total = total + (stop - a) end
+    end
+    return total
+end
+
+-- How hard a machine works: busy % (real work over the window), % of cycles with ready work
+-- waiting for it, whether the history covers (nearly) the whole window yet, and the recipes that
+-- waited most often.
 local function machinePressure(name)
     local list = machineLoad[name]
     if not list or #list == 0 then return nil end
@@ -605,17 +658,21 @@ local function machinePressure(name)
     for pid in pairs(count) do pids[#pids + 1] = pid end
     table.sort(pids, function(a, b) if count[a] ~= count[b] then return count[a] > count[b] end return a < b end)
     local window = cfg.machineAlertSeconds or 300
-    local covered = now() - list[1].t >= 0.9 * window
-    return math.floor(100 * limited / #list + 0.5), covered, pids
+    local span = now() - list[1].t
+    local covered = span >= 0.9 * window
+    local busyPct = math.floor(100 * busySeconds(name, window) / math.max(1, math.min(window, span)) + 0.5)
+    return math.min(100, busyPct), math.floor(100 * limited / #list + 0.5), covered, pids
 end
 
--- Machines currently at capacity: { [name] = { pct, waiting } }.
+-- Machines currently at capacity: { [name] = { busy, waiting } }.
 local function machinesAtCapacity()
     local out = {}
     if stopped.machines then return out end
     for name in pairs(cfg.machines or {}) do
-        local pct, covered, pids = machinePressure(name)
-        if pct and covered and pct >= (cfg.machineAlertPct or 90) then out[name] = { pct = pct, waiting = pids } end
+        local busy, waitPct, covered, pids = machinePressure(name)
+        if busy and covered and busy >= (cfg.machineAlertPct or 75) and waitPct >= (cfg.machineBacklogPct or 50) then
+            out[name] = { busy = busy, waiting = pids }
+        end
     end
     return out
 end
@@ -761,8 +818,8 @@ local function buildAlerts(notes)
         local top = {}
         for i = 1, math.min(3, #mc.waiting) do top[i] = mc.waiting[i] end
         add("atcapacity:" .. name, string.format(
-            "%s AT CAPACITY: work waited for it %d%% of the last %d min (%s). It's limiting throughput; another %s would raise it.",
-            string.upper(name), mc.pct, window, table.concat(top, ", "), name))
+            "%s AT CAPACITY: busy %d%% of the last %d min with work waiting (%s). It's limiting throughput; another %s would raise it.",
+            string.upper(name), mc.busy, window, table.concat(top, ", "), name))
         found[#found].severity = "advisory" -- a limit, not a fault
     end
 
@@ -926,10 +983,10 @@ local function buildStatus()
     add("Machines", colors.lightGray)
     for name in pairs(cfg.machines or {}) do
         local st = machineState[name] or {}
-        local pct, covered = machinePressure(name)
-        local atCap = covered and pct and pct >= (cfg.machineAlertPct or 90)
+        local busy, _, covered = machinePressure(name)
+        local atCap = machinesAtCapacity()[name] ~= nil
         add(string.format("%-12s %s%s%s", name, busyReason(st) or "idle", stopped.machines and " (loading stopped)" or "",
-            pct and string.format("   queue %d%%%s", pct, covered and "" or " (warming up)") or ""),
+            busy and string.format("   busy %d%%%s", busy, covered and "" or " (warming up)") or ""),
             st.stalled and colors.red or ((stopped.machines or atCap) and colors.orange or colors.white))
     end
     for _, p in ipairs(model.processes) do
@@ -1165,7 +1222,7 @@ function Factory.init(extraOverrides)
     lastNotes, lastActions, lastStock, lastProjected = {}, {}, {}, {}
     blocksInMe = nil
     alerts, alertOrder, trackSince, deviation, slowSince = {}, {}, {}, { reactors = {} }, nil
-    machineLoad = {}
+    machineLoad, machineRuns, opSecondsLearned = {}, {}, {}
     local saved = readTableFile(cfg.stateFile)
     for name, process in pairs(saved or {}) do
         machineState[name] = { process = process }
@@ -1287,7 +1344,7 @@ function Factory.cycle()
         stock = stock, pending = pending, busy = busy, running = running, crafting = crafting, craftable = craftable,
         craftsStopped = stopped.machines,
     })
-    if stopped.machines then machineLoad = {} else sampleMachines(waiting) end
+    if stopped.machines then machineLoad, machineRuns = {}, {} else sampleMachines(waiting) end
 
     -- 5. Act.
     for _, a in ipairs(actions) do
