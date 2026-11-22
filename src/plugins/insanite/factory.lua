@@ -403,7 +403,7 @@ end
 --region reactors
 
 local function observeReactor(id, r)
-    local info = { present = wrap(id) ~= nil, feedable = r.inlet ~= nil and wrap(r.inlet) ~= nil }
+    local info = { present = wrap(id) ~= nil }
     if info.present then
         local stats = call(id, "getFuelStats")
         if type(stats) == "table" then
@@ -426,13 +426,48 @@ local function observeReactor(id, r)
     return info
 end
 
-local function feedReactor(p, ops)
-    local r = cfg.reactors[p.reactor]
-    local inp = p.inputs[1]
-    local def = cfg.resources[inp.res]
-    local moved = exportTo(def, r.inlet, ops * inp.qty)
-    if moved > 0 then
-        event("%s <- %d %s", shortId(p.reactor), moved, def.kind == "fluid" and ("mB " .. inp.res) or inp.res)
+--endregion
+
+--region AE2 crafts (yellorium, liquid cyanite, liquid magentite only)
+
+local craftableCache = {}   -- res -> { value, at }
+
+-- AE2's generic filters need the kind for fluids.
+local function genericFilter(def)
+    return { type = (def.kind == "fluid") and "fluid" or "item", name = def.id }
+end
+
+local function isCraftable(res)
+    local cached = craftableCache[res]
+    if cached and now() - cached.at < 60 then return cached.value end
+    local value = call(cfg.bridge, "isCraftable", genericFilter(cfg.resources[res])) == true
+    craftableCache[res] = { value = value, at = now() }
+    return value
+end
+
+local function isCrafting(res)
+    return call(cfg.bridge, "isCrafting", genericFilter(cfg.resources[res])) == true
+end
+
+local function requestCraft(p, ops)
+    -- Second line of defence: never ask AE2 for anything outside the allowlist.
+    if not InsanitePlanner.ALLOWED_CRAFTS[p.output] then
+        event("refused AE2 craft of %s (not allowed)", tostring(p.output))
+        return
+    end
+    local def = cfg.resources[p.output]
+    local amount = ops * p.outQty
+    local ok, err
+    if def.kind == "fluid" then
+        ok, err = call(cfg.bridge, "craftFluid", { name = def.id, amount = amount })
+    else
+        ok, err = call(cfg.bridge, "craftItem", { name = def.id, count = amount })
+    end
+    if ok then
+        event("AE2 craft %s %s", def.kind == "fluid" and string.format("%.1fB", amount / 1000) or tostring(amount), p.output)
+    else
+        event("AE2 craft %s failed: %s", p.output, tostring(err))
+        craftableCache[p.output] = nil
     end
 end
 
@@ -453,6 +488,7 @@ local function blockers(notes)
     for _, p in ipairs(model.processes) do
         local res = (notes[p.id] or ""):match("^needs (.+)$")
         if res and not model.producerOf[res] then out[#out + 1] = p.id .. " needs " .. res end
+        if notes[p.id] == "no AE2 pattern" then out[#out + 1] = p.id .. ": no AE2 pattern" end
     end
     for name, st in pairs(machineState) do
         if st.offline or st.foreign or st.stalled then out[#out + 1] = name .. " " .. busyReason(st) end
@@ -479,10 +515,7 @@ local function buildAlerts(notes)
     if d and d.unconstrained > 0 and d.rate < d.unconstrained * slowAt then
         local pct = math.floor(d.rate / d.unconstrained * 100 + 0.5)
         if d.limitKind == "overflow" then
-            local cov = 0
-            for _, r in pairs(d.reactors) do
-                if r.output == d.limitId then cov = r.cov end
-            end
+            local cov = (d.pools[d.limitId] or {}).cov or 0
             local text = string.format("PLANT SLOWED to %d%%: %s piling up in ME (%.1f blk, target %g)",
                 pct, cfg.resources[d.limitId].label or d.limitId, cov, cfg.stockBlocks or 2)
             local b = blockers(notes)
@@ -499,10 +532,12 @@ local function buildAlerts(notes)
                 end
             end
         elseif d.limitKind == "capacity" then
-            local r = d.reactors[d.limitId]
+            local pool = d.pools[d.limitId]
+            local several = #pool.members > 1
             add("capacity:" .. d.limitId, string.format(
-                "PLANT SLOWED to %d%%: %s at its max burn (%.2f of %.2f mB/t needed); other reactors matched",
-                pct, shortId(d.limitId), r.capacity or 0, d.unconstrained * r.share * r.trim))
+                "PLANT SLOWED to %d%%: %s at %s max burn (%.2f of %.2f mB/t needed for %s); other reactors matched",
+                pct, pool.label, several and "their combined" or "its", pool.capacity or 0,
+                d.unconstrained * pool.share * pool.trim, pool.waste))
         end
     end
     if not causeless then slowSince = nil end
@@ -513,7 +548,7 @@ local function buildAlerts(notes)
     for id, e in pairs(deviation.reactors) do
         local r = d and d.reactors[id]
         local floor = r and 0.1 * plantRate * r.share or 0
-        local measuredBurn = r and e.pace * r.share or 0
+        local measuredBurn = e.measured or 0
         local off = (e.target > 0) and math.abs(measuredBurn - e.target) / math.max(e.target, floor) or 0
         if e.tracking and off > limit then
             trackSince[id] = trackSince[id] or now()
@@ -522,7 +557,7 @@ local function buildAlerts(notes)
                 local rod = (_G.InsaniteRods and InsaniteRods.state(id)) or {}
                 local why = ""
                 if (info.fuelAmount or 0) < 1000 then
-                    why = " - out of fuel"
+                    why = " - out of fuel (check its ME importer)"
                 elseif e.tracking < 0 and (rod.level or 100) <= 1 then
                     why = " - rods fully out"
                 elseif e.tracking > 0 and (rod.level or 0) >= 99 then
@@ -663,44 +698,59 @@ local function buildStatus()
         end
     end
 
-    add("Reactor mode  trim  fuel rods  burn/target mB/t   dev", colors.lightGray)
+    -- One row per reactor; reactors that make the same waste form a pool (e.g. R6+R8 -> cyanite)
+    -- and share its trim and deviation.
+    add("Reactor makes      trim  fuel rods  burn/target mB/t   dev  note", colors.lightGray)
     for _, p in ipairs(model.processes) do
         if p.machine == "reactor" then
-            local info = reactorInfo[p.reactor] or {}
-            local rod = _G.InsaniteRods and InsaniteRods.state(p.reactor) or {}
-            local r = rateDetail and rateDetail.reactors[p.reactor]
-            local e = deviation.reactors[p.reactor]
-            local fuel = (info.present and (info.fuelCapacity or 0) > 0)
-                and string.format("%3d%%", math.floor(info.fuelAmount / info.fuelCapacity * 100)) or "  - "
-            local mode = _G.InsaniteRods and InsaniteRods.modeOf(p.reactor) or p.rodControl
-            local dev = "    -"
-            if e and e.isRef then dev = "  ref" elseif e and e.dev then dev = string.format("%+4.0f%%", e.dev * 100) end
-            -- '!' marks deviation beyond what trim asked for (the part that isn't intended)
-            local beyond = e and e.dev and e.expected and math.abs(e.dev - e.expected) > (cfg.deviationAlertPct or 15) / 100
-            if beyond then dev = dev .. "!" end
-            local text = string.format("%-6s %-5s %5s %s %4s %6.2f/%-6.2f %5s %s", shortId(p.reactor), mode,
-                r and string.format("x%.2f", r.trim) or "", fuel,
-                rod.level and string.format("%3.0f%%", rod.level) or "  - ",
-                rod.measured or 0, rateTargets[p.reactor] or 0, dev, lastNotes[p.id] or "")
-            if rod.capacity then text = text .. string.format(" max %.2f", rod.capacity) end
-            if rod.lastError then text = text .. " ERR " .. rod.lastError end
-            local color = colors.white
-            if rod.capacity then color = colors.orange end
-            if beyond then color = colors.orange end
-            if alerts["track:" .. p.reactor] or rod.lastError then color = colors.red end
-            add(text, color)
+            local pe = deviation.pools and deviation.pools[p.output]
+            for _, id in ipairs(p.members) do
+                local info = reactorInfo[id] or {}
+                local rod = _G.InsaniteRods and InsaniteRods.state(id) or {}
+                local r = rateDetail and rateDetail.reactors[id]
+                local target = rateTargets[id] or 0
+                local fuel = (info.present and (info.fuelCapacity or 0) > 0)
+                    and string.format("%3d%%", math.floor(info.fuelAmount / info.fuelCapacity * 100)) or "  - "
+                local dev = "    -"
+                if pe and pe.isRef then dev = "  ref" elseif pe and pe.dev then dev = string.format("%+4.0f%%", pe.dev * 100) end
+                -- '!' marks deviation beyond what trim asked for (the part that isn't intended)
+                local beyond = pe and pe.dev and pe.expected and math.abs(pe.dev - pe.expected) > (cfg.deviationAlertPct or 15) / 100
+                if beyond then dev = dev .. "!" end
+                local note = ""
+                local mode = _G.InsaniteRods and InsaniteRods.modeOf(id) or p.rodControl[id]
+                if not info.present then
+                    note = "not connected"
+                elseif (info.fuelAmount or 0) < 1000 then
+                    note = "out of fuel (ME importer?)"
+                elseif mode == "power" then
+                    note = "energy control"
+                elseif target <= 0 then
+                    note = "idle (rate 0)"
+                end
+                if rod.capacity then note = note .. string.format(" max %.2f", rod.capacity) end
+                if rod.lastError then note = note .. " ERR " .. rod.lastError end
+                local text = string.format("%-7s %-10s %5s %s %4s %6.2f/%-6.2f %5s %s", shortId(id),
+                    (cfg.resources[p.output].label or p.output):sub(1, 10),
+                    r and string.format("x%.2f", r.trim) or "", fuel,
+                    rod.level and string.format("%3.0f%%", rod.level) or "  - ",
+                    rod.measured or 0, target, dev, note)
+                local color = colors.white
+                if rod.capacity or beyond then color = colors.orange end
+                if alerts["track:" .. id] or rod.lastError then color = colors.red end
+                add(text, color)
+            end
         end
     end
     -- Footnote: what trim alone accounts for, so an intended deviation doesn't look like a fault.
     local fromTrim = {}
     for _, p in ipairs(model.processes) do
-        local e = deviation.reactors[p.reactor or ""]
-        if e and e.expected and not e.isRef and math.abs(e.expected) >= 0.005 then
-            fromTrim[#fromTrim + 1] = string.format("%s %+.0f%%", shortId(p.reactor), e.expected * 100)
+        local pe = p.machine == "reactor" and deviation.pools and deviation.pools[p.output]
+        if pe and pe.expected and not pe.isRef and math.abs(pe.expected) >= 0.005 then
+            fromTrim[#fromTrim + 1] = string.format("%s %+.0f%%", p.label, pe.expected * 100)
         end
     end
     add(string.format("dev = burn pace vs %s in recipe ratio, 0%% = exact.%s ! = off by more than trim explains",
-        shortId(deviation.ref or cfg.referenceReactor),
+        deviation.refLabel or shortId(cfg.referenceReactor),
         #fromTrim > 0 and (" From trim alone: " .. table.concat(fromTrim, ", ") .. ".") or ""),
         colors.lightGray, nil, true)
 
@@ -792,7 +842,7 @@ function Factory.init(extraOverrides)
     end
     need, opsPerBlock = InsanitePlanner.computeNeeds(model)
 
-    machineState, reactorInfo, lastEject = {}, {}, {}
+    machineState, reactorInfo, lastEject, craftableCache = {}, {}, {}, {}
     lastNotes, lastActions, lastStock, lastProjected = {}, {}, {}, {}
     alerts, alertOrder, trackSince, deviation, slowSince = {}, {}, {}, { reactors = {} }, nil
     local saved = readTableFile(cfg.stateFile)
@@ -888,17 +938,23 @@ function Factory.cycle()
     end
     rateTargets = burnTarget
 
-    -- 4. Plan dosing and fuel.
+    -- 4. Plan batch-machine loads and AE2 craft requests (reactor fuel is the ME importer's job).
+    local crafting, craftable = {}, {}
+    for _, p in ipairs(model.processes) do
+        if p.machine == "ae2" then
+            crafting[p.output] = isCrafting(p.output)
+            craftable[p.output] = isCraftable(p.output)
+        end
+    end
     local actions, notes, projected = InsanitePlanner.plan(cfg, model, need, {
-        stock = stock, pending = pending, busy = busy,
-        reactors = reactors, burnTarget = burnTarget,
+        stock = stock, pending = pending, busy = busy, crafting = crafting, craftable = craftable,
     })
 
     -- 5. Act.
     for _, a in ipairs(actions) do
         local p = a.process
-        if p.machine == "reactor" then
-            feedReactor(p, a.ops)
+        if p.machine == "ae2" then
+            requestCraft(p, a.ops)
         else
             runBatch(p, a.ops)
         end

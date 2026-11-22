@@ -3,9 +3,12 @@
 --
 -- Drives the real plugin code against a fake world: an ME Bridge over an in-memory ME store,
 -- a reprocessor (1 item slot + 5000 mB tank, one 2-second operation at a time), a
--- solid-mixing fluidizer, and four reactors whose burn rate follows their control rods, each
--- with a stand-in core Reactor object whose updateRods the plugin replaces. A simulated player
--- crafts Insanite Blocks out of ME by hand; the plugin must never call AE2 crafting.
+-- solid-mixing fluidizer, an ME importer that refuels the reactors (the player's own setup;
+-- the plugin never feeds fuel), four reactors whose burn rate follows their control rods (R6
+-- and R8 both make cyanite ingots, R5 magentite ingots, R7 rossinite fluid), each with a
+-- stand-in core Reactor object whose updateRods the plugin replaces, and a fake AE2 that
+-- crafts yellorium / liquid cyanite / liquid magentite over time and records ANY other craft
+-- request as a violation. A simulated player crafts Insanite Blocks out of ME by hand.
 
 dofile("test/cc_stubs.lua")
 table.pack = table.pack or function(...) return { n = select("#", ...), ... } end
@@ -36,7 +39,15 @@ local function writePlant(text)
 end
 local function id(res) return D.resources[res].id end
 local R5, R6, R7, R8 = "BigReactors-Reactor_5", "BigReactors-Reactor_6", "BigReactors-Reactor_7", "BigReactors-Reactor_8"
-local SHARE = { [R6] = 184, [R8] = 32, [R5] = 16, [R7] = 24 } -- fuel per Insanite Block (x1000 mB)
+-- Fuel per Insanite Block (x1000 mB) per reactor pool: cyanite pool = R6 + R8.
+local POOL_SHARE = { cyanite = 216, magentite = 16, rossinite = 24 }
+
+local function copy(t)
+    if type(t) ~= "table" then return t end
+    local o = {}
+    for k, v in pairs(t) do o[k] = copy(v) end
+    return o
+end
 
 --region 1. ratios
 
@@ -48,20 +59,34 @@ do
     local expected = {
         insanite = 8, inanite = 8, netherite_block = 1,
         benitoite = 128, rossinite = 24000, verderium = 24000, ridiculite = 16, ludicrite = 32,
-        magentite_fluid = 16000, cyanite_fluid = 32000, blutonium = 92, cyanite = 184,
+        magentite_fluid = 16000, magentite = 16, cyanite_fluid = 32000, blutonium = 92, cyanite = 216,
         water = 92000, yellorium = 240,
     }
     for res, value in pairs(expected) do
         check(math.abs((need[res] or -1) - value) < 1e-9, string.format("need %-16s = %s", res, value))
     end
     local expectedOps = { blutonium = 92, ludicrite = 32, ridiculite = 16, inanite = 8, insanite = 8, verderium = 12,
-        [R6] = 184, [R8] = 32, [R5] = 16, [R7] = 24 }
+        ["reactors cyanite"] = 216, ["reactors magentite"] = 16, ["reactors rossinite"] = 24,
+        ["craft cyanite_fluid"] = 32, ["craft magentite_fluid"] = 16, ["craft yellorium"] = 240 }
     for pid, value in pairs(expectedOps) do
         check(math.abs((ops[pid] or -1) - value) < 1e-9, string.format("ops %-22s = %s", pid, value))
     end
+    check(#model.pools.cyanite.members == 2, "R6 and R8 form one cyanite pool")
+
+    local crafts = {}
     for _, p in ipairs(model.processes) do
-        check(p.machine ~= "ae2", "no AE2 crafting process: " .. p.id)
+        if p.machine == "ae2" then crafts[#crafts + 1] = p.output end
     end
+    table.sort(crafts)
+    check(table.concat(crafts, ",") == "cyanite_fluid,magentite_fluid,yellorium",
+        "AE2 crafts are exactly yellorium, liquid cyanite, liquid magentite")
+
+    -- Even if a config tried, nothing else can become a craft.
+    local sneaky = copy(D)
+    sneaky.crafts.insanite = { outQty = 1, inputs = {} }
+    sneaky.autocraft.insanite = true
+    local m2 = InsanitePlanner.buildModel(sneaky)
+    check(m2.byId["craft insanite"] == nil, "a non-allowed craft in the config is ignored by the model")
 end
 
 --endregion
@@ -91,12 +116,15 @@ end
 
 --region fake world
 
+local ALLOWED = { [id("yellorium")] = "item", [id("cyanite_fluid")] = "fluid", [id("magentite_fluid")] = "fluid" }
+
 local function newWorld(opts)
     opts = opts or {}
     peripheral._registry = {}
     fs.delete(D.stateFile)
 
-    local W = { me = { item = {}, fluid = {} }, stats = { mixed = 0, stuck = 0, aeCalls = 0, crafted = 0 } }
+    local W = { me = { item = {}, fluid = {} },
+        stats = { mixed = 0, stuck = 0, badCrafts = 0, badFilters = 0, crafted = 0, craftRequests = {}, craftDuplicates = 0 } }
     local me = W.me
     local function add(kind, gid, n) me[kind][gid] = (me[kind][gid] or 0) + n end
 
@@ -167,11 +195,11 @@ local function newWorld(opts)
             self.setRodLevels(self.powerWant or 100)
         end,
     }
-    local inlets = {}
     for rid, r in pairs(D.reactors) do
         local R = { fuel = 0, waste = 0, cap = 20000, rod = 100, maxBurn = maxBurn[rid], burnedTotal = 0,
             fuelId = id(r.fuel), fuelKind = D.resources[r.fuel].kind,
-            wasteId = id(r.waste), wasteKind = D.resources[r.waste].kind }
+            wasteId = id(r.waste), wasteKind = D.resources[r.waste].kind,
+            importer = not (opts.noImporter or {})[rid] }
         W.reactors[rid] = R
         R.core = setmetatable({
             id = rid, active = true, activelyCooled = false, rodLevel = 100,
@@ -182,29 +210,36 @@ local function newWorld(opts)
         peripheral.register(rid, "BigReactors-Reactor", {
             getFuelStats = function() return { fuelAmount = R.fuel, fuelCapacity = R.cap, wasteAmount = R.waste } end,
         })
-        local inlet = "test:inlet_" .. rid
-        inlets[rid] = { inlet = inlet }
-        peripheral.register(inlet, "inventory", {
-            _insertItem = function(gid, n)
-                if R.fuelKind ~= "item" or gid ~= R.fuelId then return 0 end
-                local k = math.min(n, math.floor((R.cap - R.fuel - R.waste) / 1000))
-                if k <= 0 then return 0 end
-                R.fuel = R.fuel + k * 1000
-                return k
-            end,
-            _insertFluid = function(gid, n)
-                if R.fuelKind ~= "fluid" or gid ~= R.fuelId then return 0 end
-                local k = math.min(n, R.cap - R.fuel - R.waste)
-                if k <= 0 then return 0 end
-                R.fuel = R.fuel + k
-                return k
-            end,
-        })
     end
 
-    -- ME Bridge (AE2 crafting methods exist but must never be used)
+    -- Fake AE2: the three allowed crafts take 10 s; anything else is a violation.
+    local jobs = {} -- { gid, kind, amount, doneAt }
+    local function pending(gid)
+        for _, j in ipairs(jobs) do if j.gid == gid then return true end end
+        return false
+    end
+    local function startJob(gid, kind, amount)
+        if ALLOWED[gid] ~= kind then
+            W.stats.badCrafts = W.stats.badCrafts + 1
+            return nil, "NOT_ALLOWED"
+        end
+        if (opts.noPatterns or {})[gid] then return nil, "NOT_CRAFTABLE" end
+        if pending(gid) then W.stats.craftDuplicates = W.stats.craftDuplicates + 1 end
+        if gid == id("cyanite_fluid") or gid == id("magentite_fluid") then
+            local ingot = (gid == id("cyanite_fluid")) and id("cyanite") or id("magentite")
+            local need = math.ceil(amount / 1000)
+            if (me.item[ingot] or 0) < need then return nil, "MISSING_ITEMS" end
+            add("item", ingot, -need)
+        end
+        jobs[#jobs + 1] = { gid = gid, kind = kind, amount = amount, doneAt = (W.t or 0) + 10 }
+        W.stats.craftRequests[gid] = (W.stats.craftRequests[gid] or 0) + amount
+        return true
+    end
+    local function generic(f)
+        if not f.type then W.stats.badFilters = W.stats.badFilters + 1 end
+        return f
+    end
     local function target(name) return peripheral._registry[name] and peripheral._registry[name].methods end
-    local function aeCall() W.stats.aeCalls = W.stats.aeCalls + 1; return nil, "NOT_ALLOWED" end
     peripheral.register(D.bridge, "me_bridge", {
         getItem = function(f) return { name = f.name, amount = me.item[f.name] or 0 } end,
         getFluid = function(f) return { name = f.name, amount = me.fluid[f.name] or 0 } end,
@@ -224,7 +259,13 @@ local function newWorld(opts)
         end,
         importItem = function() return 0 end,
         importFluid = function() return 0 end,
-        isCraftable = aeCall, isCrafting = aeCall, craftItem = aeCall, getCraftingTasks = aeCall,
+        isCraftable = function(f)
+            generic(f)
+            return ALLOWED[f.name] == f.type and not (opts.noPatterns or {})[f.name]
+        end,
+        isCrafting = function(f) generic(f); return pending(f.name) end,
+        craftItem = function(f) return startJob(f.name, "item", f.count or 1) end,
+        craftFluid = function(f) return startJob(f.name, "fluid", f.amount or 1000) end,
     })
 
     -- The player crafting one Insanite Block by hand (8 insanite + 8 inanite + 1 netherite).
@@ -267,7 +308,26 @@ local function newWorld(opts)
             add("fluid", id("verderium"), 2000)
         end
 
+        -- AE2 jobs finishing
+        for i = #jobs, 1, -1 do
+            local j = jobs[i]
+            if (W.t or 0) >= j.doneAt then
+                add(j.kind, j.gid, j.amount)
+                table.remove(jobs, i)
+            end
+        end
+
         for _, R in pairs(W.reactors) do
+            -- the player's ME importer: refill below half, from ME
+            if R.importer and R.fuel < R.cap / 2 then
+                if R.fuelKind == "item" then
+                    local k = math.min(math.floor((R.cap * 0.8 - R.fuel - R.waste) / 1000), me.item[R.fuelId] or 0)
+                    if k > 0 then add("item", R.fuelId, -k); R.fuel = R.fuel + k * 1000 end
+                else
+                    local k = math.min(R.cap * 0.8 - R.fuel - R.waste, me.fluid[R.fuelId] or 0)
+                    if k > 0 then add("fluid", R.fuelId, -k); R.fuel = R.fuel + k end
+                end
+            end
             local burn = math.min(20 * R.maxBurn * (1 - R.rod / 100), R.fuel)
             R.fuel = R.fuel - burn
             R.waste = R.waste + burn
@@ -286,12 +346,13 @@ local function newWorld(opts)
         end
     end
 
-    W.reactorOverrides = inlets
     return W
 end
 
 local function stockUp(W)
     W.me.item[id("yellorium")] = 100000
+    W.me.item[id("blutonium")] = 64
+    W.me.fluid[id("verderium")] = 24000
     W.me.fluid[id("water")] = 1e12
     W.me.item[id("benitoite")] = 10000
     W.me.item[id("netherite_block")] = 500
@@ -301,13 +362,7 @@ end
 local function runWorld(W, seconds, overrides, opts)
     opts = opts or {}
     if not opts.continue then
-        overrides = overrides or {}
-        overrides.reactors = overrides.reactors or {}
-        for rid, inl in pairs(W.reactorOverrides) do
-            overrides.reactors[rid] = overrides.reactors[rid] or {}
-            overrides.reactors[rid].inlet = inl.inlet
-        end
-        writePlant(PLANT_TEXT)
+        writePlant(opts.plantText or PLANT_TEXT)
         InsaniteFactory.init(overrides)
         W.t = 0
     end
@@ -331,15 +386,20 @@ end
 
 local function amount(W, res) return W.me[D.resources[res].kind][id(res)] or 0 end
 
+-- Fuel burned per pool vs the recipe (cyanite pool = R6 + R8).
 local function burnRatioOk(W, tolerance)
-    local b = {}
-    for rid, R in pairs(W.reactors) do b[rid] = R.burnedTotal / 1000 end
-    local ok = true
-    for _, rid in ipairs({ R6, R8, R7 }) do
-        local want = SHARE[rid] / SHARE[R5]
-        if b[R5] <= 0 or math.abs((b[rid] / b[R5]) / want - 1) > tolerance then ok = false end
+    local b = {
+        cyanite = (W.reactors[R6].burnedTotal + W.reactors[R8].burnedTotal) / 1000,
+        magentite = W.reactors[R5].burnedTotal / 1000,
+        rossinite = W.reactors[R7].burnedTotal / 1000,
+    }
+    local ok = b.magentite > 0
+    for _, pool in ipairs({ "cyanite", "rossinite" }) do
+        local want = POOL_SHARE[pool] / POOL_SHARE.magentite
+        if not ok or math.abs((b[pool] / b.magentite) / want - 1) > tolerance then ok = false end
     end
-    return ok, string.format("%.0f:%.0f:%.0f:%.0f", b[R6], b[R8], b[R5], b[R7])
+    return ok, string.format("%.0f:%.0f:%.0f (R6 %.0f + R8 %.0f)", b.cyanite, b.magentite, b.rossinite,
+        W.reactors[R6].burnedTotal / 1000, W.reactors[R8].burnedTotal / 1000)
 end
 
 --endregion
@@ -359,8 +419,9 @@ do
     for res, n in pairs(need) do stock[res] = D.stockBlocks * n end
     stock.insanite, stock.inanite = 0, 0
     local t, d = InsanitePlanner.rateTargets(D, model, need, ops, stock, maxPace, {})
-    check(math.abs(t[R6] / t[R5] - 184 / 16) < 1e-9 and math.abs(t[R8] / t[R5] - 2) < 1e-9 and math.abs(t[R7] / t[R5] - 1.5) < 1e-9,
-        string.format("burn ratio R6:R8:R5:R7 = 184:32:16:24 (%.2f:%.2f:%.2f:%.2f mB/t)", t[R6], t[R8], t[R5], t[R7]))
+    check(math.abs((t[R6] + t[R8]) / t[R5] - 216 / 16) < 1e-9 and math.abs(t[R7] / t[R5] - 24 / 16) < 1e-9,
+        string.format("burn ratio (R6+R8):R5:R7 = 216:16:24 (%.2f:%.2f:%.2f mB/t)", t[R6] + t[R8], t[R5], t[R7]))
+    check(math.abs(t[R6] - t[R8]) < 1e-9, "R6 and R8 split the cyanite pool evenly when neither is limited")
     check(d.demand == 1 and d.limit == "max pace", "empty kit -> full pace")
 
     stock.insanite, stock.inanite = D.stockBlocks * 8, D.stockBlocks * 8
@@ -371,29 +432,41 @@ do
     t, d = InsanitePlanner.rateTargets(D, model, need, ops, stock, maxPace, {})
     check(math.abs(d.rate / maxPace - 0.5) < 1e-9, "half a block short -> half pace (demandGain 1)")
 
-    -- The slowest reactor sets the pace for all four.
+    -- The slowest pool sets the pace for all.
     stock.insanite, stock.inanite = 0, 0
     local full = InsanitePlanner.rateTargets(D, model, need, ops, stock, maxPace, {})
     t, d = InsanitePlanner.rateTargets(D, model, need, ops, stock, maxPace, { [R5] = full[R5] / 2 })
     check(math.abs(t[R5] - full[R5] / 2) < 1e-9 and math.abs(t[R6] - full[R6] / 2) < 1e-9 and math.abs(t[R7] - full[R7] / 2) < 1e-9,
         "reactor 5 at half its share -> yellorium & verderium reactors halve too")
-    check(d.limit == R5 .. " max burn", "status names the limiting reactor")
-    t = InsanitePlanner.rateTargets(D, model, need, ops, stock, maxPace, { [R6] = full[R6] / 4 })
-    check(math.abs(t[R5] - full[R5] / 4) < 1e-9, "and vice versa: reactor 6 at a quarter -> reactor 5 at a quarter")
+    check(d.limit == "R5 max burn", "status names the limiting reactor (" .. d.limit .. ")")
 
-    -- Trim: a surplus/shortage of one waste nudges only that reactor, within +-maxTrim.
+    -- Inside the cyanite pool: a weak member is held at its max, the other takes the rest.
+    t, d = InsanitePlanner.rateTargets(D, model, need, ops, stock, maxPace, { [R8] = full[R8] / 4 })
+    check(math.abs(t[R8] - full[R8] / 4) < 1e-9 and math.abs(t[R6] + t[R8] - (full[R6] + full[R8])) < 1e-9,
+        "R8 limited -> R6 takes up the rest of the cyanite pool")
+    check(d.rate == maxPace, "a single weak pool member doesn't slow the plant")
+
+    -- Both members limited: the pool's combined max sets the pace, and the others follow.
+    local poolMax = (full[R6] + full[R8]) / 4
+    t, d = InsanitePlanner.rateTargets(D, model, need, ops, stock, maxPace, { [R6] = poolMax * 0.7, [R8] = poolMax * 0.3 })
+    check(math.abs(t[R6] + t[R8] - poolMax) < 1e-9 and math.abs(t[R5] - full[R5] / 4) < 1e-9 and d.limit == "R6+R8 max burn",
+        "R6 + R8 both at max -> plant at their combined pace (" .. d.limit .. ")")
+    t = InsanitePlanner.rateTargets(D, model, need, ops, stock, maxPace, { [R7] = full[R7] / 3 })
+    check(math.abs(t[R6] + t[R8] - (full[R6] + full[R8]) / 3) < 1e-9, "and vice versa: R7 at a third -> cyanite pool at a third")
+
+    -- Trim: a surplus/shortage of one waste nudges only that pool, within +-maxTrim.
     stock.cyanite = (D.stockBlocks + 1) * need.cyanite
-    stock.magentite_fluid = 0
+    stock.magentite = 0
     t, d = InsanitePlanner.rateTargets(D, model, need, ops, stock, maxPace, {})
     check(math.abs(d.reactors[R6].trim - 0.75) < 1e-9 and math.abs(d.reactors[R5].trim - 1.25) < 1e-9,
-        "cyanite surplus trims reactor 6 down, magentite shortage trims reactor 5 up (clamped to 25%)")
+        "cyanite surplus trims R6+R8 down, magentite shortage trims R5 up (clamped to 25%)")
     local strict = InsanitePlanner.rateTargets(setmetatable({ maxTrim = 0 }, { __index = D }),
         model, need, ops, stock, maxPace, {})
-    check(math.abs(strict[R6] / strict[R5] - 184 / 16) < 1e-9, "maxTrim = 0 -> strictly locked ratio despite the imbalance")
+    check(math.abs((strict[R6] + strict[R8]) / strict[R5] - 216 / 16) < 1e-9, "maxTrim = 0 -> strictly locked ratio despite the imbalance")
 
     -- Overflow: a waste far above target means something downstream is blocked.
     stock.cyanite = D.stockBlocks * need.cyanite
-    stock.magentite_fluid = D.stockBlocks * need.magentite_fluid
+    stock.magentite = D.stockBlocks * need.magentite
     stock.rossinite = (D.stockBlocks + D.overflowBlocks) * need.rossinite
     t, d = InsanitePlanner.rateTargets(D, model, need, ops, stock, maxPace, {})
     check(d.rate == 0 and d.limit == "overflow rossinite", "rossinite piling up (no benitoite?) -> plant stops")
@@ -486,7 +559,7 @@ end
 
 --region 5. full plant
 
-print("full plant: player crafts a block every 400 s for 6 h, then stops for 3 h")
+print("full plant: ME importer refuels, player crafts a block every 400 s for 6 h, then stops for 3 h")
 do
     _G.__simClock = 0
     local W = newWorld()
@@ -498,18 +571,24 @@ do
     local need = InsaniteFactory.needs()
     local crafted = W.stats.crafted
     check(next(raised) == nil, "healthy plant raised no alerts (" .. tostring(next(raised) and raised[next(raised)]) .. ")")
-
-    check(W.stats.aeCalls == 0, "AE2 crafting never called")
+    check(W.stats.badCrafts == 0 and W.stats.badFilters == 0, "AE2 only ever asked for the three allowed crafts, with typed filters")
+    check((W.stats.craftRequests[id("cyanite_fluid")] or 0) > 0 and (W.stats.craftRequests[id("magentite_fluid")] or 0) > 0,
+        string.format("liquid cyanite (%.0fB) and liquid magentite (%.0fB) came from AE2 crafts",
+            (W.stats.craftRequests[id("cyanite_fluid")] or 0) / 1000, (W.stats.craftRequests[id("magentite_fluid")] or 0) / 1000))
+    check(W.stats.craftDuplicates == 0, "never re-requested a craft that was still running")
     check(W.stats.mixed == 0 and W.stats.stuck == 0, "reprocessor never mixed recipes or got stuck")
     check(crafted >= 40, string.format("player crafted %d of 54 attempted blocks (max pace %.1f/h)", crafted,
         InsaniteFactory.plantRate() * 72000))
     local ok, ratio = burnRatioOk(W, 0.10)
-    check(ok, "fuel burned R6:R8:R5:R7 = " .. ratio .. " (recipe 184:32:16:24, within 10%)")
-    for _, res in ipairs({ "blutonium", "ludicrite", "ridiculite", "inanite", "insanite", "verderium" }) do
-        local limit = D.stockBlocks * need[res] + ((D.resources[res].kind == "fluid") and 32000 or 32)
+    check(ok, "fuel burned cyanite:magentite:rossinite pools = " .. ratio .. " (recipe 216:16:24, within 10%)")
+    check(math.abs(W.reactors[R6].burnedTotal / W.reactors[R8].burnedTotal - 1) < 0.15,
+        "R6 and R8 shared the cyanite pool evenly")
+    for _, res in ipairs({ "blutonium", "ludicrite", "ridiculite", "inanite", "insanite", "verderium",
+        "cyanite_fluid", "magentite_fluid" }) do
+        local limit = D.stockBlocks * need[res] + ((D.resources[res].kind == "fluid") and 32000 or 64)
         check((W.peaks[res] or 0) <= limit, string.format("%-15s peak %-7s <= %s", res, tostring(W.peaks[res]), tostring(limit)))
     end
-    for _, res in ipairs({ "cyanite", "cyanite_fluid", "magentite_fluid", "rossinite" }) do
+    for _, res in ipairs({ "cyanite", "magentite", "rossinite" }) do
         local limit = (D.stockBlocks + D.overflowBlocks) * need[res]
         check((W.peaks[res] or 0) <= limit, string.format("%-15s peak %-7s <= %s", res, tostring(W.peaks[res]), tostring(limit)))
     end
@@ -524,10 +603,9 @@ do
     local allIn = true
     for _, R in pairs(W.reactors) do if R.rod < 99.9 then allIn = false end end
     check(allIn, "all four reactors' rods fully inserted")
-    print("  info " .. InsaniteFactory.statusLines()[2].text)
 end
 
-print("weak blutonium reactor (1 mB/t max, needs 2.3): the yellorium reactors slow to match")
+print("weak blutonium reactor (1 mB/t max, needs 2.9): the yellorium reactors slow to match")
 do
     _G.__simClock = 0
     local W = newWorld({ maxBurn = { [R5] = 1.0 } })
@@ -537,14 +615,31 @@ do
         if t > 3600 then
             cycles = cycles + 1
             local d = InsaniteFactory.rateDetail()
-            if d and d.limit == R5 .. " max burn" then limitedTicks = limitedTicks + 1 end
+            if d and d.limit == "R5 max burn" then limitedTicks = limitedTicks + 1 end
         end
     end })
     check(limitedTicks / cycles > 0.8, string.format("reactor 5 is the named limit %.0f%% of the time", 100 * limitedTicks / cycles))
     local ok, ratio = burnRatioOk(W, 0.10)
     check(ok, "fuel burned still in recipe ratio: " .. ratio)
     check(W.reactors[R6].rod > 10, string.format("reactor 6 throttled to match (rods %.0f%% in, not flat out)", W.reactors[R6].rod))
-    check(W.stats.mixed == 0 and W.stats.stuck == 0 and W.stats.aeCalls == 0, "no mixing, no stuck batches, no AE2 calls")
+    check(W.stats.mixed == 0 and W.stats.stuck == 0 and W.stats.badCrafts == 0, "no mixing, no stuck batches, no disallowed crafts")
+end
+
+print("weak R8 inside the cyanite pool (1 mB/t max): R6 picks up the slack, nothing slows")
+do
+    _G.__simClock = 0
+    local W = newWorld({ maxBurn = { [R8] = 1.0 } })
+    stockUp(W)
+    local slowed = 0
+    runWorld(W, 4 * 3600, {}, { craftEvery = 400, onCycle = function(t)
+        local d = InsaniteFactory.rateDetail()
+        if t > 3600 and d and d.limitKind == "capacity" then slowed = slowed + 1 end
+    end })
+    check(slowed == 0, "the plant was never capacity-limited")
+    check(W.reactors[R6].burnedTotal > 5 * W.reactors[R8].burnedTotal,
+        string.format("R6 burned %.0f vs R8 %.0f ingots", W.reactors[R6].burnedTotal / 1000, W.reactors[R8].burnedTotal / 1000))
+    local ok, ratio = burnRatioOk(W, 0.10)
+    check(ok, "pools still in recipe ratio: " .. ratio)
 end
 
 --endregion
@@ -575,7 +670,7 @@ end
 
 --region 7. kit full from the start
 
-print("kit already full: nothing is fueled or burned")
+print("kit already full: reactors held, nothing crafted")
 do
     _G.__simClock = 0
     local W = newWorld()
@@ -584,20 +679,52 @@ do
     local need = InsanitePlanner.computeNeeds(model)
     for res, n in pairs(need) do
         local def = D.resources[res]
-        if res ~= "water" and res ~= "yellorium" and res ~= "benitoite" and res ~= "netherite_block" then
-            W.me[def.kind][def.id] = D.stockBlocks * n
+        if res ~= "water" and res ~= "benitoite" and res ~= "netherite_block" then
+            W.me[def.kind][def.id] = D.stockBlocks * n + ((res == "yellorium") and 1000 or 0)
         end
     end
     runWorld(W, 120)
-    local fed = false
-    for _, R in pairs(W.reactors) do if R.fuel > 0 or R.burnedTotal > 0 then fed = true end end
-    check(not fed, "no reactor fueled or burning while the kit is at target")
-    check(InsaniteFactory.lastNotes()[R5] == "idle (rate 0)", "status says why (rate 0)")
+    local burned = false
+    for _, R in pairs(W.reactors) do if R.burnedTotal > 0 then burned = true end end
+    check(not burned, "no reactor burns while the kit is at target (the importer may still fill them)")
+    check(next(W.stats.craftRequests) == nil, "no AE2 craft requested while everything is at target")
+    check(InsaniteFactory.lastNotes()["craft yellorium"] == "at target", "status says why")
 end
 
 --endregion
 
---region 8. ratio deviation + alerts
+--region 8. AE2 craft requests
+
+print("AE2 craft requests: only the three allowed, sized, not repeated, honest about missing patterns")
+do
+    _G.__simClock = 0
+    local W = newWorld()
+    stockUp(W)
+    W.me.item[id("yellorium")] = 0
+    runWorld(W, 60)
+    local yell = W.stats.craftRequests[id("yellorium")] or 0
+    check(yell > 0 and yell <= D.maxCraftItems * 6, string.format("yellorium short -> requested %d via craftItem", yell))
+    check(W.stats.craftDuplicates == 0, "one request at a time per item")
+
+    _G.__simClock = 0
+    W = newWorld({ noPatterns = { [id("cyanite_fluid")] = true } })
+    stockUp(W)
+    runWorld(W, 600)
+    check(InsaniteFactory.lastNotes()["craft cyanite_fluid"] == "no AE2 pattern", "missing AE2 pattern is shown on the status screen")
+    check((W.stats.craftRequests[id("cyanite_fluid")] or 0) == 0, "and nothing is requested for it")
+
+    _G.__simClock = 0
+    W = newWorld()
+    stockUp(W)
+    W.me.item[id("yellorium")] = 0
+    runWorld(W, 60, nil, { plantText = PLANT_TEXT:gsub("yellorium = true,", "yellorium = false,", 1) })
+    check((W.stats.craftRequests[id("yellorium")] or 0) == 0, "autocraft.yellorium = false -> never requested")
+    check(W.stats.badCrafts == 0 and W.stats.badFilters == 0, "no disallowed crafts, filters typed (item/fluid)")
+end
+
+--endregion
+
+--region 9. ratio deviation + alerts
 
 print("ratio deviation vs the reference reactor")
 do
@@ -610,14 +737,13 @@ do
     local t, d = InsanitePlanner.rateTargets(D, model, need, ops, stock, maxPace, {})
     local measured = { [R6] = t[R6], [R8] = t[R8], [R5] = t[R5] / 2, [R7] = t[R7] * 1.1 }
     local dev = InsanitePlanner.deviations(D, d, measured)
-    check(dev.ref == R6 and dev.reactors[R6].isRef, "reference is reactor 6")
-    check(math.abs(dev.reactors[R8].dev) < 1e-9, "R8 on target -> 0% deviation")
+    check(dev.ref == "cyanite" and dev.reactors[R6].isRef and dev.reactors[R8].isRef, "reference is R6's pool (R6+R8)")
     check(math.abs(dev.reactors[R5].dev + 0.5) < 1e-9 and math.abs(dev.reactors[R5].tracking + 0.5) < 1e-9,
-        "R5 burning half its share -> -50% vs R6 and -50% vs its own target")
+        "R5 burning half its share -> -50% vs the cyanite pool and -50% vs its own target")
     check(math.abs(dev.reactors[R7].dev - 0.1) < 1e-9, "R7 10% fast -> +10%")
-    measured[R6] = 0
+    measured[R6], measured[R8] = 0, 0
     dev = InsanitePlanner.deviations(D, d, measured)
-    check(dev.ref == R5, "reference falls back to a burning reactor when R6 is idle")
+    check(dev.ref == "magentite", "reference falls back to a burning pool when R6's is idle")
     local wrapped = InsaniteFactory.wrapText("PLANT SLOWED to 40%: Rossinite piling up in ME", 16, "  ")
     local fits, joined = true, {}
     for _, l in ipairs(wrapped) do
@@ -649,15 +775,11 @@ do
     W.me.item[id("benitoite")] = 0
     runWorld(W, 4 * 3600)
     local d = InsaniteFactory.rateDetail()
-    local overflowKey, overflowText
-    for key, text in pairs(alertKeys()) do
-        if key == "overflow" then overflowKey, overflowText = key, text end
-    end
+    local text = alertKeys()["overflow"]
     check(d.limitKind == "overflow" and d.rate < d.unconstrained, string.format("plant slowed (%s, %.1f of %.1f blk/h)",
         d.limit, d.rate * 72000, d.unconstrained * 72000))
-    check(overflowKey ~= nil and overflowText:find("benitoite") ~= nil,
-        "alert: " .. tostring(overflowText))
-    check(scada["insanite:" .. tostring(overflowKey)] ~= nil, "same alert raised in the core alarm list (SCADA)")
+    check(text ~= nil and text:find("insanite needs benitoite", 1, true) ~= nil, "alert: " .. tostring(text))
+    check(scada["insanite:overflow"] ~= nil, "same alert raised in the core alarm list (SCADA)")
     local lines = InsaniteFactory.statusLines()
     check(lines[1].bg == colors.red and lines[2].text:find("ALERT") ~= nil, "red alert banner at the top of the screen")
 
@@ -668,6 +790,17 @@ do
     check(W.stats.mixed == 0 and W.stats.stuck == 0, "no mixing or stuck batches throughout")
 end
 
+print("missing AE2 pattern for liquid magentite: blocks ridiculite, alert names it")
+do
+    _G.__simClock = 0
+    scada = {}
+    local W = newWorld({ noPatterns = { [id("magentite_fluid")] = true } })
+    stockUp(W)
+    runWorld(W, 4 * 3600)
+    local text = alertKeys()["overflow"]
+    check(text ~= nil and text:find("craft magentite_fluid: no AE2 pattern", 1, true) ~= nil, "alert: " .. tostring(text))
+end
+
 print("weak reactor: max-burn alert")
 do
     _G.__simClock = 0
@@ -675,40 +808,37 @@ do
     local W = newWorld({ maxBurn = { [R5] = 1.0 } })
     stockUp(W)
     runWorld(W, 3600, {}, { craftEvery = 200 })
-    local text = alertKeys()["capacity:" .. R5]
-    check(text ~= nil and text:find("R5 at its max burn") ~= nil, "alert: " .. tostring(text))
+    local text = alertKeys()["capacity:magentite"]
+    check(text ~= nil and text:find("R5 at its max burn", 1, true) ~= nil, "alert: " .. tostring(text))
     local dev = InsaniteFactory.deviation()
     local worst = 0
-    for rid, e in pairs(dev.reactors) do
+    for _, e in pairs(dev.pools) do
         if e.dev and not e.isRef then worst = math.max(worst, math.abs(e.dev - e.expected)) end
     end
-    check(worst < 0.10, string.format("all reactors still within %.0f%% of the locked ratio (beyond trim)", worst * 100))
+    check(worst < 0.10, string.format("all pools still within %.0f%% of the locked ratio (beyond trim)", worst * 100))
 end
 
-print("starved reactor: fluidizer port missing -> no verderium -> reactor 7 out of fuel")
+print("starved reactor: R7's ME importer not working -> out-of-fuel alert")
 do
     _G.__simClock = 0
     scada = {}
-    local W = newWorld()
+    local W = newWorld({ noImporter = { [R7] = true } })
     stockUp(W)
-    peripheral._registry[D.machines.fluidizer.ports.a] = nil
     runWorld(W, 1800)
-    local keys = alertKeys()
-    check(keys["machine:fluidizer"] ~= nil, "alert: " .. tostring(keys["machine:fluidizer"]))
-    check(keys["track:" .. R7] ~= nil and keys["track:" .. R7]:find("out of fuel") ~= nil,
-        "alert: " .. tostring(keys["track:" .. R7]))
-    check(InsaniteFactory.rateDetail().limit ~= R7 .. " max burn", "an empty reactor is not mistaken for a max-burn limit")
+    local text = alertKeys()["track:" .. R7]
+    check(text ~= nil and text:find("out of fuel (check its ME importer)", 1, true) ~= nil, "alert: " .. tostring(text))
+    check(InsaniteFactory.rateDetail().limit ~= "R7 max burn", "an empty reactor is not mistaken for a max-burn limit")
 end
 
 _G.AlarmManager = nil
 
 --endregion
 
---region 9. plant config check
+--region 10. plant config check
 
 print("plant config check (network = the in-game `peripherals` list)")
 do
-    -- Exactly what `peripherals` showed on the controller computer.
+    -- What `peripherals` shows on the controller computer (plus monitor_3, the status monitor).
     local NET = {
         bottom = { "me_bridge", "storage_bridge", "multi_drive" },
         top = { "modem", "peripheral_hub" },
@@ -718,16 +848,11 @@ do
         ["bigreactors:fluidizersolidinjector_0"] = { "bigreactors:fluidizersolidinjector", "inventory" },
         ["bigreactors:fluidizersolidinjector_1"] = { "bigreactors:fluidizersolidinjector", "inventory" },
         monitor_2 = { "monitor" },
+        monitor_3 = { "monitor" },
         left = { "monitor" },
         [R5] = { "BigReactors-Reactor" }, [R6] = { "BigReactors-Reactor" },
         [R7] = { "BigReactors-Reactor" }, [R8] = { "BigReactors-Reactor" },
     }
-    local function copy(t)
-        if type(t) ~= "table" then return t end
-        local o = {}
-        for k, v in pairs(t) do o[k] = copy(v) end
-        return o
-    end
     local function check_(mutate)
         local plant = copy(PLANT)
         mutate(plant)
@@ -748,6 +873,35 @@ do
     local e, w = InsanitePlanner.validatePlant(PLANT, INSANITE_DEFAULTS, NET)
     check(#e == 0 and #w == 0, "repo insanite.conf matches the in-game network: no problems (" .. show(e) .. show(w) .. ")")
 
+    -- What changed in this round
+    e, w = check_(function(p) p.reactors[R5].inlet = false end)
+    check(#e == 0 and has(w, ".inlet is no longer used", "ME importer", "delete that line"),
+        "a leftover inlet line is only a warning: " .. show(w))
+
+    e = check_(function(p) p.autocraft = nil end)
+    check(#e == 1 and has(e, "autocraft is missing", "yellorium = true,", "cyanite_fluid = true,", "magentite_fluid = true,"),
+        "missing autocraft section -> ready-to-paste block: " .. show(e))
+
+    e = check_(function(p) p.autocraft.insanite = true end)
+    check(has(e, "autocraft.insanite", "may only ask AE2 to craft cyanite_fluid, magentite_fluid, yellorium"),
+        "crafting anything else is refused: " .. show(e))
+
+    e = check_(function(p) p.autocraft.magentite_fluid = nil end)
+    check(has(e, "autocraft.magentite_fluid is missing", "Liquid", "magentite_fluid = true,") or
+        has(e, "autocraft.magentite_fluid is missing", "magentite_fluid = true,"), "one craft not stated: " .. show(e))
+
+    e = check_(function(p) p.reactors[R8].waste = "cyanite_fluid" end)
+    check(has(e, '"cyanite_fluid" would come from both', "autocraft.cyanite_fluid", "Pick one"),
+        "reactor fluid outlet + AE2 craft for the same liquid: " .. show(e))
+
+    e, w = check_(function(p) p.autocraft.magentite_fluid = false end)
+    check(#e == 0 and has(w, 'Nothing here produces "magentite_fluid"', "ridiculite",
+        "set autocraft.magentite_fluid = true", "Fuel Injection Port"), "no source for liquid magentite: " .. show(w))
+
+    e = check_(function(p) end)
+    check(#e == 0, "R6 and R8 both making cyanite is fine (they form a pool)")
+
+    -- Unchanged checks
     e = check_(function(p) p.bridge = nil end)
     check(has(e, "bridge is missing", 'bridge = "me_bridge_2",'), "missing bridge, suggests the real name: " .. show(e))
 
@@ -764,23 +918,20 @@ do
     end)
     check(has(e, "did you swap solid and fluid?"), "swapped injectors caught: " .. show(e))
 
-    e = check_(function(p) p.reactors[R5].inlet = nil; p.reactors[R5].inlett = false end)
-    check(has(e, ".inlett is not a reactor setting", "Did you mean inlet?"), "typo'd key: " .. show(e))
-    check(has(e, '.inlet is missing', "inlet = false,"), "missing inlet offers both choices")
+    e = check_(function(p) p.reactors[R5].outlett = false end)
+    check(has(e, ".outlett is not a reactor setting", "Did you mean outlet?"), "typo'd key: " .. show(e))
+
+    e = check_(function(p) p.reactors[R5].outlet = nil end)
+    check(has(e, ".outlet is missing", "outlet = false,"), "missing outlet offers both choices")
 
     e = check_(function(p) p.reactors[R5].waste = "cyanite" end)
-    check(has(e, "doesn't match fuel", '"magentite_fluid" (fluid, from a Fuel Injection Port in outlet mode)'),
+    check(has(e, "doesn't match fuel", '"magentite" (ingots, from a Solid Access Port in outlet mode)'),
         "waste/fuel mismatch explained: " .. show(e))
 
-    e, w = check_(function(p) p.reactors[R8].waste = "cyanite" end)
-    check(has(e, "all have waste = \"cyanite\""), "two reactors making the same waste: " .. show(e))
-    check(has(w, 'No reactor has waste = "cyanite_fluid"', "ludicrite", "Fuel Injection Port"),
-        "and the now-missing cyanite fluid is flagged: " .. show(w))
-
-    e = check_(function(p) p.reactors[R6].inlet = "bigreactors:fluidizersolidinjector_0" end)
+    e = check_(function(p) p.reactors[R6].outlet = "bigreactors:fluidizersolidinjector_0" end)
     check(has(e, "is used for both machines.fluidizer.ports.a and reactors"), "one peripheral used twice: " .. show(e))
 
-    e = check_(function(p) p.reactors[R6].inlet = "bigreactors:reprocessorwasteinjector_0"; p.machines.reprocessor.ports.solid = "x" end)
+    e = check_(function(p) p.reactors[R6].outlet = "bigreactors:reprocessorwasteinjector_0"; p.machines.reprocessor.ports.solid = "x" end)
     check(has(e, "is a bigreactors:reprocessorwasteinjector, but it must be a Reactor Solid Access Port"),
         "wrong kind of device: " .. show(e))
 
@@ -791,7 +942,7 @@ do
     check(has(e, "stockBlocks must be a number", 'the text "2"'), "wrong type: " .. show(e))
 
     e, w = check_(function(p) p.monitor = "monitor_9" end)
-    check(#e == 0 and has(w, 'monitor = "monitor_9" is not on the wired network', "Monitors on the network now: monitor_2, left"),
+    check(#e == 0 and has(w, 'monitor = "monitor_9" is not on the wired network', "Monitors on the network now: monitor_2, monitor_3, left"),
         "device not on the network lists the real ones: " .. show(w))
 
     e = check_(function(p) p.monitor = nil end)
@@ -803,7 +954,7 @@ do
         "whole machines section missing -> one ready-to-paste block from the network: " .. show(e))
 
     e = check_(function(p) p.reactors = nil end)
-    check(#e == 1 and has(e, "reactors is missing", '["BigReactors-Reactor_5"]', '["BigReactors-Reactor_8"]'),
+    check(has(e, "reactors is missing", '["BigReactors-Reactor_5"]', '["BigReactors-Reactor_8"]'),
         "reactors section missing -> template with the 4 reactors on the network")
 
     e, w = check_(function(p) p.reactors["BigReactors-Reactor_9"] = p.reactors[R8]; p.reactors[R8] = nil end)
@@ -829,7 +980,7 @@ do
     check(plant == nil and has(errs, "syntax error", "/insanite.conf:", "missing comma"), "syntax error with line number: " .. show(errs))
 
     -- The plugin refuses to start and writes the full list where the player can read it.
-    writePlant(PLANT_TEXT:gsub('monitor = "monitor_2",', '', 1))
+    writePlant((PLANT_TEXT:gsub('monitor = "monitor_3",', '', 1)))
     local ok, problem = pcall(InsaniteFactory.init)
     check(not ok and type(problem) == "table" and has(problem.plantErrors, "monitor is missing"), "init refuses to start on a bad config")
     local saved = print

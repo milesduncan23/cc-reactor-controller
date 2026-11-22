@@ -1,7 +1,11 @@
 -- Insanite factory plugin: planning logic. Pure functions, no peripherals (unit-testable).
 --
 -- Model: every machine runs "processes" (recipes) that turn input resources into one output.
--- Reactors are processes too (fuel -> waste, per 1000 mB of reactant).
+--   * batch machines (reprocessor, fluidizer) are loaded by the plugin
+--   * AE2 crafts: only yellorium, liquid cyanite and liquid magentite, and only when enabled
+--   * reactors: fuel -> waste, per 1000 mB of reactant. Reactors with the same waste form one
+--     pool (e.g. R6 + R8 -> cyanite) that shares that waste's production.
+-- Fuel is NOT planned: the player's own ME importer refuels the reactors.
 --
 -- Ratios: computeNeeds() walks the recipe graph back from ONE kit (what an Insanite Block is
 -- crafted from: 8 insanite + 8 inanite + 1 netherite block) and records how much of every
@@ -10,18 +14,24 @@
 -- Reserves: each product's coverage = its ME stock / per-block need = "how many Insanite
 -- Blocks' worth ME holds". Everything is kept at stockBlocks coverage, i.e. in recipe ratio.
 --
--- Batch machines (pull): wanted work is sorted by coverage, lowest first, and greedily handed
--- machines and inputs, so the single reprocessor always makes whatever is furthest behind.
+-- Batch machines and crafts (pull): wanted work is sorted by coverage, lowest first, and
+-- greedily handed machines and inputs, so the single reprocessor always makes whatever is
+-- furthest behind and a scarce shared input goes to the product that needs it most.
 --
 -- Reactors (locked rate): rateTargets() picks ONE plant rate (Insanite Blocks per tick) and
--- gives every reactor rate x its fuel per block, so the four burn in exact recipe ratio. The
--- rate follows how far the finished kit in ME is below target, and is capped so no reactor is
--- asked for more than it can actually burn: the yellorium reactors burn exactly as much as the
--- blutonium/verderium reactors can, and vice versa.
+-- gives every reactor pool rate x its fuel per block, so the pools burn in exact recipe ratio.
+-- The rate follows how far the finished kit in ME is below target, and is capped so no pool is
+-- asked for more than it can burn: the yellorium reactors burn exactly as much as the blutonium
+-- and verderium reactors can, and vice versa. Inside a pool, the target is split evenly, except
+-- that a member at its max burn is held there and the others take the rest.
 
 local Planner = {}
 
 local HUGE = math.huge
+
+-- The only things the plugin may ever ask AE2 to craft. Anything else is refused here and in
+-- the factory, whatever the config says.
+Planner.ALLOWED_CRAFTS = { yellorium = true, cyanite_fluid = true, magentite_fluid = true }
 
 local function clamp(value, lo, hi)
     if value < lo then return lo end
@@ -43,6 +53,10 @@ local function sortedKeys(t)
     return keys
 end
 
+local function shortName(id)
+    return (tostring(id):gsub("BigReactors%-Reactor_", "R"))
+end
+
 -- Build the process graph from config. Returns model, errors (list of strings).
 function Planner.buildModel(cfg)
     local model = {
@@ -52,6 +66,8 @@ function Planner.buildModel(cfg)
         producerOf = {},
         consumersOf = {},
         kit = cfg.kit or {},
+        pools = {},        -- waste -> reactor pool process
+        poolOf = {},       -- reactorId -> pool process
     }
     local errors = {}
 
@@ -83,30 +99,65 @@ function Planner.buildModel(cfg)
         end
     end
 
-    for i, src in ipairs(cfg.processes or {}) do
+    local order = 0
+    for _, src in ipairs(cfg.processes or {}) do
         local p = {}
         for k, v in pairs(src) do p[k] = v end
-        p.order = i
+        order = order + 1
+        p.order = order
         p.outQty = p.outQty or 1
         add(p)
     end
 
-    for n, id in ipairs(sortedKeys(cfg.reactors)) do
+    -- AE2 crafts: only allowed ones, only when enabled in the plant config.
+    for _, res in ipairs(sortedKeys(cfg.crafts)) do
+        local c = cfg.crafts[res]
+        if Planner.ALLOWED_CRAFTS[res] and (cfg.autocraft or {})[res] == true then
+            order = order + 1
+            local inputs = {}
+            for _, inp in ipairs(c.inputs or {}) do inputs[#inputs + 1] = { res = inp.res, qty = inp.qty } end
+            add({ id = "craft " .. res, machine = "ae2", output = res, outQty = c.outQty or 1,
+                inputs = inputs, order = order })
+        end
+    end
+
+    -- Reactor pools: every reactor with the same waste produces it together.
+    local members = {}
+    for _, id in ipairs(sortedKeys(cfg.reactors)) do
         local r = cfg.reactors[id]
         local fuel, waste = model.resources[r.fuel], model.resources[r.waste]
         if not fuel or not waste then
             errors[#errors + 1] = id .. ": unknown fuel/waste resource"
         else
-            add({
-                id = id,
-                machine = "reactor",
-                reactor = id,
-                rodControl = r.rodControl or "ratio",
-                output = r.waste,
-                outQty = unitOf(waste),
-                inputs = { { res = r.fuel, qty = unitOf(fuel) } },
-                order = #(cfg.processes or {}) + n,
-            })
+            members[r.waste] = members[r.waste] or { fuel = r.fuel, ids = {} }
+            if members[r.waste].fuel ~= r.fuel then
+                errors[#errors + 1] = id .. ": reactors making " .. r.waste .. " burn different fuels"
+            end
+            table.insert(members[r.waste].ids, id)
+        end
+    end
+    for _, waste in ipairs(sortedKeys(members)) do
+        local m = members[waste]
+        local rodControl = {}
+        for _, id in ipairs(m.ids) do rodControl[id] = cfg.reactors[id].rodControl or "ratio" end
+        local label = {}
+        for _, id in ipairs(m.ids) do label[#label + 1] = shortName(id) end
+        order = order + 1
+        local pool = {
+            id = "reactors " .. waste,
+            label = table.concat(label, "+"),
+            machine = "reactor",
+            members = m.ids,
+            rodControl = rodControl,
+            output = waste,
+            outQty = unitOf(model.resources[waste]),
+            inputs = { { res = m.fuel, qty = unitOf(model.resources[m.fuel]) } },
+            order = order,
+        }
+        add(pool)
+        if model.byId[pool.id] == pool then
+            model.pools[waste] = pool
+            for _, id in ipairs(m.ids) do model.poolOf[id] = pool end
         end
     end
 
@@ -124,6 +175,7 @@ function Planner.buildModel(cfg)
 end
 
 -- Per-kit requirement of every resource, and operations of every process per kit.
+-- (A reactor pool's ops are in units of 1000 mB of fuel.)
 function Planner.computeNeeds(model)
     local need, ops, visiting = {}, {}, {}
     local needOf
@@ -196,30 +248,13 @@ function Planner.machineCapacityOps(cfg, machine, p)
     return cap
 end
 
--- Fuel (mB) a reactor should hold: enough for fuelLeadSeconds at its burn target, within
--- [fuelMinPct, fuelMaxPct] of capacity; 0 while its target is 0. "power" reactors keep the
--- plain band. Returns desired mB, or nil if no top-up is needed.
-function Planner.desiredFuel(cfg, rodControl, info, target)
-    local cap = info.fuelCapacity or 0
-    local lo = cap * (cfg.fuelMinPct or 10) / 100
-    local hi = cap * (cfg.fuelMaxPct or 80) / 100
-    if rodControl == "power" then
-        if info.fuelAmount < lo then return hi end
-        return nil
-    end
-    if not target or target <= 0 then return nil end
-    local desired = clamp(target * 20 * (cfg.fuelLeadSeconds or 600), lo, hi)
-    if info.fuelAmount >= 0.9 * desired then return nil end
-    return desired
-end
-
--- One planning pass.
+-- One planning pass over the batch machines and AE2 crafts (reactors aren't planned here).
 -- snap = {
---   stock      = { [res] = amount in ME (exportable) },
---   pending    = { [res] = amount inside batch machines, on its way to ME },
---   busy       = { [machineName] = reason string or nil },
---   reactors   = { [id] = { present, feedable, fuelAmount, fuelCapacity, wasteAmount } },
---   burnTarget = { [id] = mB/t from rateTargets },
+--   stock     = { [res] = amount in ME (exportable) },
+--   pending   = { [res] = amount inside batch machines, on its way to ME },
+--   busy      = { [machineName] = reason string or nil },
+--   crafting  = { [res] = true while an AE2 job for it is running },
+--   craftable = { [res] = false when AE2 has no pattern for it },
 -- }
 -- Returns actions (list of { process, ops }), notes ({ [processId] = state text }), projected.
 function Planner.plan(cfg, model, need, snap)
@@ -232,64 +267,46 @@ function Planner.plan(cfg, model, need, snap)
     local candidates, notes = {}, {}
 
     for _, p in ipairs(model.processes) do
-        local cand = {
-            p = p,
-            cov = Planner.coverage(need, projected, p.output),
-            wanted = opsWanted(cfg, need, projected, p),
-            class = 1,
-        }
-
-        if p.machine == "reactor" then
-            local r = (snap.reactors or {})[p.reactor]
-            local target = (snap.burnTarget or {})[p.reactor]
-            if not r or not r.present then
-                notes[p.id] = "not connected"
-            elseif not r.feedable then
-                notes[p.id] = "no inlet port set"
-            elseif (r.fuelCapacity or 0) <= 0 then
-                notes[p.id] = "no fuel capacity reported"
-            else
-                local desired = Planner.desiredFuel(cfg, p.rodControl, r, target)
-                if not desired then
-                    notes[p.id] = (p.rodControl ~= "power" and (target or 0) <= 0) and "idle (rate 0)" or "fuel ok"
+        if p.machine ~= "reactor" then
+            local cand = {
+                p = p,
+                cov = Planner.coverage(need, projected, p.output),
+                wanted = opsWanted(cfg, need, projected, p),
+            }
+            if p.machine == "ae2" then
+                local fluid = (model.resources[p.output] or {}).kind == "fluid"
+                if not Planner.ALLOWED_CRAFTS[p.output] then
+                    notes[p.id] = "not allowed"
+                elseif (snap.crafting or {})[p.output] then
+                    notes[p.id] = "AE2 crafting"
+                elseif (snap.craftable or {})[p.output] == false then
+                    notes[p.id] = "no AE2 pattern"
                 else
-                    local room = r.fuelCapacity - r.fuelAmount - (r.wasteAmount or 0)
-                    local unit = p.inputs[1].qty
-                    local perCycle = (unit == 1) and (cfg.maxFuelItemsPerCycle or 64)
-                        or math.floor((cfg.maxFuelFluidPerCycle or 16000) / unit)
-                    local short = math.floor((desired - r.fuelAmount) / 1000)
-                    local fits = math.floor(room / 1000)
-                    cand.cap = math.min(short, fits, perCycle)
-                    cand.wanted = HUGE
-                    if p.rodControl == "power" then cand.class = 0 end
-                    if cand.cap < 1 then
-                        notes[p.id] = (fits < 1) and "tank full of waste" or "fuel ok"
-                        cand.cap = nil
-                    end
+                    local most = fluid and (cfg.maxCraftFluid or 16000) or (cfg.maxCraftItems or 64)
+                    cand.cap = math.max(1, math.floor(most / p.outQty))
+                end
+            else
+                local m = (cfg.machines or {})[p.machine]
+                if not m then
+                    notes[p.id] = "machine not configured"
+                elseif (snap.busy or {})[p.machine] then
+                    notes[p.id] = p.machine .. " " .. snap.busy[p.machine]
+                else
+                    cand.cap = Planner.machineCapacityOps(cfg, m, p)
                 end
             end
-        else
-            local m = (cfg.machines or {})[p.machine]
-            if not m then
-                notes[p.id] = "machine not configured"
-            elseif (snap.busy or {})[p.machine] then
-                notes[p.id] = p.machine .. " " .. snap.busy[p.machine]
-            else
-                cand.cap = Planner.machineCapacityOps(cfg, m, p)
-            end
-        end
 
-        if cand.cap then
-            if cand.wanted <= 0 then
-                notes[p.id] = "at target"
-            else
-                candidates[#candidates + 1] = cand
+            if cand.cap then
+                if cand.wanted <= 0 then
+                    notes[p.id] = "at target"
+                else
+                    candidates[#candidates + 1] = cand
+                end
             end
         end
     end
 
     table.sort(candidates, function(a, b)
-        if a.class ~= b.class then return a.class < b.class end
         if a.cov ~= b.cov then return a.cov < b.cov end
         return a.p.order < b.p.order
     end)
@@ -297,7 +314,7 @@ function Planner.plan(cfg, model, need, snap)
     local actions, taken = {}, {}
     for _, c in ipairs(candidates) do
         local p = c.p
-        local exclusive = p.machine ~= "reactor"
+        local exclusive = p.machine ~= "ae2"
         if exclusive and taken[p.machine] then
             notes[p.id] = "waiting (" .. p.machine .. " -> " .. taken[p.machine] .. ")"
         else
@@ -314,7 +331,13 @@ function Planner.plan(cfg, model, need, snap)
                 end
                 if exclusive then taken[p.machine] = p.id end
                 actions[#actions + 1] = { process = p, ops = ops }
-                notes[p.id] = (p.machine == "reactor") and ("fuel +" .. ops) or ("start x" .. ops)
+                if p.machine == "ae2" then
+                    local def = model.resources[p.output]
+                    local amount = ops * p.outQty
+                    notes[p.id] = "request " .. ((def.kind == "fluid") and string.format("%.1fB", amount / 1000) or tostring(amount))
+                else
+                    notes[p.id] = "start x" .. ops
+                end
             else
                 notes[p.id] = "needs " .. tostring(short)
             end
@@ -343,12 +366,37 @@ function Planner.plantRate(cfg, model, ops)
     return rate * (cfg.plantUtilization or 0.9)
 end
 
+-- Split a pool's target among its members: evenly, except a member whose known max burn is
+-- below its even portion is held at that max and the rest is shared by the others.
+local function splitPool(total, ids, caps)
+    local alloc, fixed = {}, {}
+    local remaining, open = total, #ids
+    local changed = true
+    while changed and open > 0 do
+        changed = false
+        local each = remaining / open
+        for _, id in ipairs(ids) do
+            if not fixed[id] and caps[id] and caps[id] < each then
+                alloc[id], fixed[id] = caps[id], true
+                remaining, open, changed = remaining - caps[id], open - 1, true
+            end
+        end
+    end
+    for _, id in ipairs(ids) do
+        if not fixed[id] then alloc[id] = remaining / math.max(open, 1) end
+    end
+    return alloc
+end
+
 -- The locked reaction rate. Returns targets ({ [reactorId] = mB/t }) and detail:
 --   rate   = common plant rate (blocks/tick)     demand = 0..1 from the kit reserve
 --   kit    = finished kit in ME (blocks)          limit  = what is holding the rate down
---   reactors[id] = { cov, trim, share, capRate }
+--   unconstrained = what the kit reserve alone asks for (rate < unconstrained = slowed)
+--   pools[waste]  = { label, members, cov, trim, share (mB fuel/block), capacity, capRate }
+--   reactors[id]  = { pool = waste, trim, cov, share (this member's mB fuel/block), capacity }
 -- capacities[id] = a reactor's measured max burn (mB/t), when known (see rods.lua).
 function Planner.rateTargets(cfg, model, need, ops, stock, plantMax, capacities)
+    capacities = capacities or {}
     local K = cfg.stockBlocks or 2
     local kit = Planner.kitCoverage(model, stock)
     local demand = clamp((cfg.demandGain or 1) * (K - kit), 0, 1)
@@ -361,78 +409,109 @@ function Planner.rateTargets(cfg, model, need, ops, stock, plantMax, capacities)
     local trimGain = cfg.trimGain or 0.25
     local overflow = cfg.overflowBlocks or 4
 
-    local locked = {}
+    local pools = {}
     for _, p in ipairs(model.processes) do
-        if p.machine == "reactor" and p.rodControl ~= "power" then
-            local cov = Planner.coverage(need, stock, p.output)
-            local trim = clamp(1 + trimGain * (K - cov), 1 - maxTrim, 1 + maxTrim)
-            locked[#locked + 1] = { id = p.reactor, output = p.output, cov = cov, trim = trim,
-                share = (ops[p.id] or 0) * 1000 } -- mB of fuel per block
+        if p.machine == "reactor" then
+            local ratioIds = {}
+            for _, id in ipairs(p.members) do
+                if p.rodControl[id] ~= "power" then ratioIds[#ratioIds + 1] = id end
+            end
+            if #ratioIds > 0 then
+                local cov = Planner.coverage(need, stock, p.output)
+                local pool = {
+                    waste = p.output, label = p.label, members = ratioIds, cov = cov,
+                    trim = clamp(1 + trimGain * (K - cov), 1 - maxTrim, 1 + maxTrim),
+                    share = (ops[p.id] or 0) * 1000, -- mB of fuel per block, whole pool
+                }
+                pools[#pools + 1] = pool
 
-            -- A waste piling up means something downstream is blocked: slow everything.
-            if overflow > 0 and cov > K then
-                local cap = plantMax * clamp(1 - (cov - K) / overflow, 0, 1)
-                if cap < rate then
-                    rate, limit, limitKind, limitId = cap, "overflow " .. p.output, "overflow", p.output
+                -- A waste piling up means something downstream is blocked: slow everything.
+                if overflow > 0 and cov > K then
+                    local cap = plantMax * clamp(1 - (cov - K) / overflow, 0, 1)
+                    if cap < rate then
+                        rate, limit, limitKind, limitId = cap, "overflow " .. p.output, "overflow", p.output
+                    end
                 end
             end
         end
     end
 
-    -- No reactor may be asked for more than it can burn; the others follow it down.
-    for _, r in ipairs(locked) do
-        local cap = capacities and capacities[r.id]
-        if cap and r.share * r.trim > 0 then
-            r.capacity = cap
-            r.capRate = cap / (r.share * r.trim)
-            if r.capRate < rate then
-                rate, limit, limitKind, limitId = r.capRate, r.id .. " max burn", "capacity", r.id
+    -- No pool may be asked for more than all its members together can burn; the others follow.
+    for _, pool in ipairs(pools) do
+        local total, known = 0, true
+        for _, id in ipairs(pool.members) do
+            if capacities[id] then total = total + capacities[id] else known = false end
+        end
+        if known and pool.share * pool.trim > 0 then
+            pool.capacity = total
+            pool.capRate = total / (pool.share * pool.trim)
+            if pool.capRate < rate then
+                rate, limit, limitKind, limitId = pool.capRate, pool.label .. " max burn", "capacity", pool.waste
             end
         end
     end
 
-    -- unconstrained = what the kit reserve alone asks for; rate < unconstrained = plant slowed.
-    local targets, detail = {}, { rate = rate, demand = demand, kit = kit, limit = limit,
-        limitKind = limitKind, limitId = limitId, unconstrained = plantMax * demand, reactors = {} }
-    for _, r in ipairs(locked) do
-        targets[r.id] = rate * r.share * r.trim
-        detail.reactors[r.id] = r
+    local targets = {}
+    local detail = { rate = rate, demand = demand, kit = kit, limit = limit, limitKind = limitKind,
+        limitId = limitId, unconstrained = plantMax * demand, pools = {}, reactors = {} }
+    for _, pool in ipairs(pools) do
+        local poolTarget = rate * pool.share * pool.trim
+        local alloc = splitPool(poolTarget, pool.members, capacities)
+        for _, id in ipairs(pool.members) do
+            targets[id] = alloc[id]
+            -- this member's slice of the pool's fuel per block (alloc / rate / trim)
+            local fraction = (poolTarget > 0) and (alloc[id] / poolTarget) or (1 / #pool.members)
+            detail.reactors[id] = { pool = pool.waste, trim = pool.trim, cov = pool.cov,
+                share = pool.share * fraction, capacity = capacities[id] }
+        end
+        detail.pools[pool.waste] = pool
     end
     return targets, detail
 end
 
--- Ratio deviation of each locked reactor's ACTUAL burn from a reference reactor.
--- pace_i = measured burn / fuel per block (the Insanite Blocks per tick that burn amounts to).
--- dev_i  = pace_i / pace_ref - 1: 0 means exactly in recipe ratio with the reference.
--- expected_i = trim_i / trim_ref - 1: the part of dev_i that trim asked for on purpose.
--- tracking_i = measured / own target - 1: how far the reactor is off what it was told.
--- The reference is cfg.referenceReactor if it is burning, else the first locked reactor that is.
--- measured = { [id] = mB/t }.
+-- Ratio deviation of each pool's ACTUAL burn from the reference reactor's pool.
+-- pace = pool's measured burn / its fuel per block (the Insanite Blocks per tick it amounts to).
+-- dev  = pace / pace_ref - 1: 0 means exactly in recipe ratio with the reference.
+-- expected = trim / trim_ref - 1: the part of dev that trim asked for on purpose.
+-- Per reactor: its pool's dev, plus tracking = measured / own target - 1.
+-- The reference is the pool of cfg.referenceReactor if it is burning, else the first burning one.
+-- measured = { [reactorId] = mB/t }.
 function Planner.deviations(cfg, detail, measured)
-    local out = { reactors = {} }
+    local out = { reactors = {}, pools = {} }
     if not detail then return out end
-    local function paceOf(id)
-        local r = detail.reactors[id]
-        if not r or r.share <= 0 then return 0 end
-        return (measured[id] or 0) / r.share
+    local function paceOf(pool)
+        if pool.share <= 0 then return 0 end
+        local sum = 0
+        for _, id in ipairs(pool.members) do sum = sum + (measured[id] or 0) end
+        return sum / pool.share
     end
 
-    local ref = cfg.referenceReactor
-    if not (detail.reactors[ref] and paceOf(ref) > 0) then
-        ref = nil
-        for _, id in ipairs(sortedKeys(detail.reactors)) do
-            if paceOf(id) > 0 then ref = id; break end
+    local refPool
+    local refId = cfg.referenceReactor
+    local refEntry = refId and detail.reactors[refId]
+    if refEntry and paceOf(detail.pools[refEntry.pool]) > 0 then refPool = detail.pools[refEntry.pool] end
+    if not refPool then
+        for _, waste in ipairs(sortedKeys(detail.pools)) do
+            if paceOf(detail.pools[waste]) > 0 then refPool = detail.pools[waste]; break end
         end
     end
-    out.ref = ref
+    out.ref = refPool and refPool.waste
+    out.refLabel = refPool and refPool.label
 
+    for waste, pool in pairs(detail.pools) do
+        local e = { pace = paceOf(pool), isRef = (pool == refPool) }
+        if refPool then
+            e.dev = e.pace / paceOf(refPool) - 1
+            e.expected = pool.trim / refPool.trim - 1
+        end
+        out.pools[waste] = e
+    end
     for id, r in pairs(detail.reactors) do
-        local e = { pace = paceOf(id), target = detail.rate * r.share * r.trim, isRef = (id == ref) }
-        if e.target > 0 then e.tracking = (measured[id] or 0) / e.target - 1 end
-        if ref then
-            e.dev = e.pace / paceOf(ref) - 1
-            e.expected = r.trim / detail.reactors[ref].trim - 1
-        end
+        local pe = out.pools[r.pool] or {}
+        local target = detail.rate * r.share * r.trim
+        local e = { dev = pe.dev, expected = pe.expected, isRef = pe.isRef, target = target,
+            measured = measured[id] or 0 }
+        if target > 0 then e.tracking = (measured[id] or 0) / target - 1 end
         out.reactors[id] = e
     end
     return out
@@ -441,9 +520,11 @@ end
 --region plant config check
 
 local SIDES = { top = true, bottom = true, left = true, right = true, front = true, back = true }
-local DEVICE_KEYS = { bridge = true, monitor = true, referenceReactor = true, machines = true, reactors = true }
+local DEVICE_KEYS = { bridge = true, monitor = true, referenceReactor = true, machines = true, reactors = true,
+    autocraft = true }
 local MACHINE_KEYS = { "ports", "output" }
-local REACTOR_KEYS = { "fuel", "waste", "rodControl", "inlet", "outlet" }
+local REACTOR_KEYS = { "fuel", "waste", "rodControl", "outlet" }
+local RETIRED_REACTOR_KEYS = { inlet = "fuel is fed by your own ME importer, not the plugin" }
 local ROD_MODES = { "ratio", "power" }
 
 local function q(v) return string.format("%q", tostring(v)) end
@@ -768,7 +849,7 @@ function Planner.validatePlant(plant, defaults, network)
         if #found == 0 then found = { "<reactor computer port name>" } end
         for _, id in ipairs(found) do
             lines[#lines + 1] = '  [' .. q(id) .. '] = { fuel = "<' .. table.concat(fuels, "|")
-                .. '>", waste = "<see fuel>", rodControl = "ratio", inlet = false, outlet = false },'
+                .. '>", waste = "<see fuel>", rodControl = "ratio", outlet = false },'
         end
         lines[#lines + 1] = "},"
         err(table.unpack(lines))
@@ -782,7 +863,7 @@ function Planner.validatePlant(plant, defaults, network)
             local r = plant.reactors[id]
             local path = "reactors[" .. q(id) .. "]"
             if type(r) ~= "table" then
-                err(path .. " must be a table like { fuel = ..., waste = ..., rodControl = ..., inlet = ..., outlet = ... }, but it is "
+                err(path .. " must be a table like { fuel = ..., waste = ..., rodControl = ..., outlet = ... }, but it is "
                     .. describe(r) .. ".")
             else
                 -- the reactor itself
@@ -802,6 +883,11 @@ function Planner.validatePlant(plant, defaults, network)
                 for _, k in ipairs(keysOf(r)) do
                     local ok = false
                     for _, want in ipairs(REACTOR_KEYS) do if k == want then ok = true end end
+                    if RETIRED_REACTOR_KEYS[k] then
+                        ok = true
+                        warn(path .. "." .. k .. " is no longer used (" .. RETIRED_REACTOR_KEYS[k] .. ").",
+                            "You can delete that line from " .. path .. ".")
+                    end
                     if not ok then
                         err(path .. "." .. tostring(k) .. " is not a reactor setting (expected: "
                             .. table.concat(REACTOR_KEYS, ", ") .. ")." .. didYouMean(tostring(k), REACTOR_KEYS))
@@ -845,14 +931,6 @@ function Planner.validatePlant(plant, defaults, network)
                     end
                 end
 
-                local fuelKind = fuelOk and (resources[r.fuel] or {}).kind
-                local inletSpec = (fuelKind == "fluid") and deviceTypes.fluidAccessPort or deviceTypes.solidAccessPort
-                checkDevice(path .. ".inlet", "inlet", r.inlet, inletSpec, {
-                    purpose = "the " .. inletSpec.what .. " in INLET mode that the plugin feeds "
-                        .. (fuelOk and r.fuel or "fuel") .. " into",
-                    where = path,
-                    none = "inlet = false,   while it isn't connected (no fuel is fed to this reactor then)" })
-
                 local wasteKind = (resources[r.waste] or {}).kind
                 local outletSpec = (wasteKind == "fluid") and deviceTypes.fluidAccessPort or deviceTypes.solidAccessPort
                 checkDevice(path .. ".outlet", "outlet", r.outlet, outletSpec, {
@@ -863,33 +941,132 @@ function Planner.validatePlant(plant, defaults, network)
             end
         end
 
-        -- Each waste must come from one reactor; every waste the recipes need should have one.
-        for _, waste in ipairs(keysOf(producers)) do
-            local ids = producers[waste]
-            if #ids > 1 then
-                err("Reactors " .. table.concat(ids, " and ") .. " all have waste = " .. q(waste) .. ".",
-                    "Each waste must come from exactly one reactor. Give the extra one(s) a different outlet form or fuel.")
+    end
+
+    -- AE2 autocraft: exactly which of the three allowed crafts are on. Must be stated explicitly.
+    local craftNames = keysOf(Planner.ALLOWED_CRAFTS)
+    local crafts = defaults.crafts or {}
+    local function craftLine(res)
+        local c = crafts[res] or {}
+        local made = (resources[res] or {}).label or res
+        if #(c.inputs or {}) == 0 then return made .. " (ingredients are up to your AE2 pattern)" end
+        local from = {}
+        for _, inp in ipairs(c.inputs) do from[#from + 1] = inp.qty .. " " .. ((resources[inp.res] or {}).label or inp.res) end
+        return made .. " from " .. table.concat(from, " + ")
+    end
+    local craftOn = {}
+    if plant.autocraft == nil or plant.autocraft == false then
+        local lines = { "autocraft is missing: which of the " .. #craftNames
+            .. " allowed AE2 crafts the plugin may request (true) or never request (false).",
+            "Add to the top-level table:", "autocraft = {" }
+        for _, res in ipairs(craftNames) do
+            lines[#lines + 1] = "  " .. res .. " = true,   -- " .. craftLine(res) .. "; needs an AE2 pattern"
+        end
+        lines[#lines + 1] = "},"
+        err(table.unpack(lines))
+    elseif type(plant.autocraft) ~= "table" then
+        err("autocraft must be a table like { yellorium = true, ... }, but it is " .. describe(plant.autocraft) .. ".")
+    else
+        for _, k in ipairs(keysOf(plant.autocraft)) do
+            if not Planner.ALLOWED_CRAFTS[k] then
+                err("autocraft." .. tostring(k) .. ": the plugin may only ask AE2 to craft "
+                    .. table.concat(craftNames, ", ") .. "." .. didYouMean(tostring(k), craftNames),
+                    "Remove that line; anything else has to be crafted by you or your own AE2 setup.")
             end
         end
-        for _, fuel in ipairs(fuels) do
-            for _, waste in ipairs(defaults.reactions[fuel]) do
-                if not producers[waste] then
-                    local users = {}
-                    for _, p in ipairs(defaults.processes or {}) do
-                        for _, inp in ipairs(p.inputs or {}) do
-                            if inp.res == waste then users[#users + 1] = p.id end
-                        end
-                    end
-                    if #users > 0 then
-                        local kind = (resources[waste] or {}).kind
-                        warn("No reactor has waste = " .. q(waste) .. ", which the " .. table.concat(users, " and ")
-                            .. " recipe" .. (#users > 1 and "s need" or " needs") .. ". It can only come from ME stock.",
-                            "To make it: give a " .. fuel .. " reactor a "
-                                .. (kind == "fluid" and "Fuel Injection Port" or "Solid Access Port")
-                                .. " in outlet mode and set its waste = " .. q(waste) .. ".")
-                    end
-                end
+        for _, res in ipairs(craftNames) do
+            local v = plant.autocraft[res]
+            if v == nil then
+                err("autocraft." .. res .. " is missing: true lets the plugin ask AE2 for " .. craftLine(res)
+                    .. " (needs an AE2 pattern); false = never.",
+                    "Add inside autocraft:   " .. res .. " = true,")
+            elseif type(v) ~= "boolean" then
+                err("autocraft." .. res .. " must be true or false, but it is " .. describe(v) .. ".")
+            elseif v then
+                craftOn[res] = true
             end
+        end
+    end
+
+    -- Sources: nothing may come from two places, and everything the recipes use should come
+    -- from somewhere (a reactor, an enabled AE2 craft, or a batch recipe).
+    local madeBy = {} -- res -> list of human-readable sources
+    for _, p in ipairs(defaults.processes or {}) do
+        madeBy[p.output] = madeBy[p.output] or {}
+        table.insert(madeBy[p.output], "the " .. p.id .. " recipe")
+    end
+    for _, waste in ipairs(keysOf(producers)) do
+        local names = {}
+        for _, id in ipairs(producers[waste]) do names[#names + 1] = "reactors[" .. q(id) .. "]" end
+        madeBy[waste] = madeBy[waste] or {}
+        table.insert(madeBy[waste], table.concat(names, " + ") .. " (waste = " .. q(waste) .. ")")
+    end
+    for _, res in ipairs(craftNames) do
+        if craftOn[res] then
+            madeBy[res] = madeBy[res] or {}
+            table.insert(madeBy[res], "autocraft." .. res)
+        end
+    end
+    for _, res in ipairs(keysOf(madeBy)) do
+        if #madeBy[res] > 1 then
+            local fix = ""
+            if craftOn[res] and producers[res] then
+                local form = (res:gsub("_fluid$", ""))
+                fix = "Pick one: let the reactor output " .. q(form) .. " ingots (Solid Access Port) and keep autocraft."
+                    .. res .. " = true, or set autocraft." .. res .. " = false."
+            end
+            err(q(res) .. " would come from both " .. table.concat(madeBy[res], " and ") .. ".", fix)
+        end
+    end
+    local usedBy = {} -- res -> consumers (recipes and enabled crafts)
+    for _, p in ipairs(defaults.processes or {}) do
+        for _, inp in ipairs(p.inputs or {}) do
+            usedBy[inp.res] = usedBy[inp.res] or {}
+            table.insert(usedBy[inp.res], "the " .. p.id .. " recipe")
+        end
+    end
+    for _, res in ipairs(craftNames) do
+        if craftOn[res] then
+            for _, inp in ipairs((crafts[res] or {}).inputs or {}) do
+                usedBy[inp.res] = usedBy[inp.res] or {}
+                table.insert(usedBy[inp.res], "autocraft." .. res)
+            end
+        end
+    end
+    if type(plant.reactors) == "table" then
+        local burners = {}
+        for _, id in ipairs(keysOf(plant.reactors)) do
+            local r = plant.reactors[id]
+            if type(r) == "table" and type(r.fuel) == "string" then
+                burners[r.fuel] = burners[r.fuel] or {}
+                table.insert(burners[r.fuel], shortName(id))
+            end
+        end
+        for fuel, ids in pairs(burners) do
+            usedBy[fuel] = usedBy[fuel] or {}
+            table.insert(usedBy[fuel], "reactor" .. (#ids > 1 and "s " or " ") .. table.concat(ids, "+") .. " (via your ME importer)")
+        end
+    end
+    local wasteFuel = {}
+    for fuel, wastes in pairs(defaults.reactions or {}) do
+        for _, w in ipairs(wastes) do wasteFuel[w] = fuel end
+    end
+    for _, res in ipairs(keysOf(usedBy)) do
+        local producible = wasteFuel[res] or Planner.ALLOWED_CRAFTS[res]
+        if producible and not madeBy[res] then
+            local ways = {}
+            if wasteFuel[res] then
+                local kind = (resources[res] or {}).kind
+                ways[#ways + 1] = "give a " .. wasteFuel[res] .. " reactor a "
+                    .. (kind == "fluid" and "Fuel Injection Port" or "Solid Access Port")
+                    .. " in outlet mode and set its waste = " .. q(res)
+            end
+            if Planner.ALLOWED_CRAFTS[res] then
+                ways[#ways + 1] = "set autocraft." .. res .. " = true (needs an AE2 pattern for " .. craftLine(res) .. ")"
+            end
+            warn("Nothing here produces " .. q(res) .. ", which " .. table.concat(usedBy[res], " and ")
+                .. (#usedBy[res] > 1 and " use" or " uses") .. ". It can only come from ME stock.",
+                "To make it: " .. table.concat(ways, ", or ") .. ".")
         end
     end
 

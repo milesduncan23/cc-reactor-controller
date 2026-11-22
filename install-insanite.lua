@@ -88,7 +88,22 @@ if not fs.exists(PLANT_PATH) then
 else
     local current = parseTable(readFile(PLANT_PATH) or "")
     local hasDevices = current and (current.bridge ~= nil or current.machines ~= nil or current.reactors ~= nil)
-    if hasDevices then
+    -- A device file from before AE2 autocraft existed: reactor inlets, no autocraft section.
+    local outdated = hasDevices and current.autocraft == nil
+    if outdated then
+        print("Your " .. PLANT_PATH .. " is from an older plugin version (no autocraft section;")
+        print("reactor inlets are no longer used). Replace it with the repo copy?")
+        print("The old file is kept as " .. PLANT_PATH .. ".old. (y/n)")
+        local answer = string.lower(read() or "")
+        if answer == "y" or answer == "yes" then
+            if fs.exists(PLANT_PATH .. ".old") then fs.delete(PLANT_PATH .. ".old") end
+            fs.move(PLANT_PATH, PLANT_PATH .. ".old")
+            writeFile(PLANT_PATH, template)
+            print("Replaced. Old file: " .. PLANT_PATH .. ".old")
+        else
+            print("Kept your " .. PLANT_PATH .. "; the check below lists what to change.")
+        end
+    elseif hasDevices then
         print("Kept your existing " .. PLANT_PATH .. ".")
     else
         if fs.exists(PLANT_PATH .. ".old") then fs.delete(PLANT_PATH .. ".old") end
